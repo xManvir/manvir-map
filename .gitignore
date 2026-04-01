@@ -1,0 +1,7 @@
+tiles/
+custom_files/
+photon_data/
+ontario-latest.osm.pbf
+node_modules/
+frontend/dist/
+*.tar.bz2

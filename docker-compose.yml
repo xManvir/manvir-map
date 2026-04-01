@@ -1,0 +1,49 @@
+services:
+  valhalla-build:
+    image: ghcr.io/valhalla/valhalla:latest
+    container_name: valhalla-build
+    volumes:
+      - ./tiles:/tiles
+      - ./custom_files:/custom_files
+      - .:/data
+    command: ["bash", "-c", "if [ -f /tiles/admins.sqlite ]; then echo 'Tiles already exist, skipping build.'; else valhalla_build_config --mjolnir-tile-dir /tiles --mjolnir-timezone /tiles/timezones.sqlite --mjolnir-admin /tiles/admins.sqlite > /custom_files/valhalla.json && valhalla_build_tiles -c /custom_files/valhalla.json /data/ontario-latest.osm.pbf; fi"]
+    restart: "no"
+
+  valhalla:
+    image: ghcr.io/valhalla/valhalla:latest
+    container_name: valhalla
+    ports:
+      - "8002:8002"
+    volumes:
+      - ./tiles:/tiles
+      - ./custom_files:/custom_files
+    command: valhalla_service /custom_files/valhalla.json 1
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: frontend
+    ports:
+      - "8082:80"
+    depends_on:
+      - valhalla
+    restart: unless-stopped
+
+  photon:
+    image: rtuszik/photon-docker:latest
+    container_name: photon
+    volumes:
+      - photon_data:/photon/data
+    environment:
+      - REGION=ca
+      - UPDATE_STRATEGY=DISABLED
+    ports:
+      - "2322:2322"
+    restart: unless-stopped
+
+volumes:
+  caddy_data:
+  caddy_certs:
+  photon_data:
