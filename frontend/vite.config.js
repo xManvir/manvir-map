@@ -10,6 +10,11 @@ export default defineConfig({
         target: 'http://localhost:8002',
         changeOrigin: true,
         rewrite: (path) => path.replace(/^\/api/, '')
+      },
+      '/photon': {
+        target: 'http://localhost:2322',
+        changeOrigin: true,
+        rewrite: (path) => path.replace(/^\/photon/, '')
       }
     }
   }
