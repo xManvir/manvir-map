@@ -216,6 +216,11 @@ function App() {
     if (map.current.getSource("route")) {
       map.current.removeLayer("route-line");
       map.current.removeSource("route");
+      map.current.flyTo({
+        center: [-79.383184, 43.653226],
+        zoom: 9,
+        duration: 1000,
+      });
     }
   }
 
