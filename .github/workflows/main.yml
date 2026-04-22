@@ -20,6 +20,6 @@ jobs:
           username: ${{ secrets.SERVER_USER }}
           key: ${{ secrets.SSH_PRIVATE_KEY }}
           script: |
-            cd /projects/valhalla-map
+            cd home/manvir/projects/valhalla-map
             git pull origin main
             docker compose up -d --build
