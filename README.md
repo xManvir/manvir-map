@@ -74,6 +74,7 @@ Navigate to `http://localhost:8082`
 - [ ] Kubernetes deployment with Longhorn persistent storage
 - [ ] Multiple routing profiles (walking, cycling, transit)
 - [ ] Turn-by-turn directions panel
+- [ ] Test
 
 ## License
 
