@@ -519,6 +519,10 @@ function App() {
       if (e.originalEvent) setMobileExpanded(false);
     });
 
+    map.current.on("click", () => {
+      if (window.innerWidth <= 640) setMobileExpanded(true);
+    });
+
     if (navigator.geolocation) {
       navigator.geolocation.getCurrentPosition(
         async (pos) => {
