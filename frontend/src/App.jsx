@@ -145,6 +145,15 @@ function App() {
   const [routeMode, setRouteMode] = useState("normal");
   const [loading, setLoading] = useState(false);
   const [showOrigin, setShowOrigin] = useState(false);
+  const [isMobile, setIsMobile] = useState(
+    typeof window !== "undefined" && window.innerWidth <= 640,
+  );
+
+  useEffect(() => {
+    const onResize = () => setIsMobile(window.innerWidth <= 640);
+    window.addEventListener("resize", onResize);
+    return () => window.removeEventListener("resize", onResize);
+  }, []);
 
   const userLocation = useRef(null);
 
@@ -378,7 +387,9 @@ function App() {
         new maplibregl.LngLatBounds(coords[0], coords[0]),
       );
       map.current.fitBounds(bounds, {
-        padding: { top: 80, bottom: 80, left: 340, right: 80 },
+        padding: isMobile
+          ? { top: 240, bottom: 80, left: 40, right: 40 }
+          : { top: 80, bottom: 80, left: 340, right: 80 },
       });
     } finally {
       setLoading(false);
@@ -401,7 +412,7 @@ function App() {
     const home = userLocation.current;
     map.current?.flyTo({
       center: home ? [home.lng, home.lat] : [-79.383184, 43.653226],
-      zoom: home ? 13 : 9,
+      zoom: home ? 15 : 9,
       duration: 1000,
     });
   }
@@ -450,10 +461,11 @@ function App() {
       <div
         style={{
           position: "absolute",
-          top: "1rem",
-          left: "1rem",
-          width: "300px",
-          maxHeight: "calc(100vh - 2rem)",
+          top: isMobile ? "0.5rem" : "1rem",
+          left: isMobile ? "0.5rem" : "1rem",
+          right: isMobile ? "0.5rem" : "auto",
+          width: isMobile ? "auto" : "300px",
+          maxHeight: isMobile ? "calc(100vh - 1rem)" : "calc(100vh - 2rem)",
           background: "rgba(18, 18, 20, 0.72)",
           backdropFilter: "blur(28px) saturate(160%)",
           WebkitBackdropFilter: "blur(28px) saturate(160%)",
@@ -838,6 +850,11 @@ function App() {
         }
         .maplibregl-ctrl-recenter:hover {
           color: #a5b4fc;
+        }
+        @media (max-width: 640px) {
+          .maplibregl-ctrl-bottom-right { margin-right: 0.5rem !important; margin-bottom: 0.5rem !important; }
+          .maplibregl-ctrl-group button { width: 42px !important; height: 42px !important; }
+          input { font-size: 16px !important; }
         }
       `}</style>
     </div>
