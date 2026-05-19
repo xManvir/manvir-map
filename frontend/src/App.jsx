@@ -469,20 +469,6 @@ function App() {
         }}
       >
         <div style={{ display: "flex", alignItems: "center", gap: "0.5rem" }}>
-          <div
-            style={{
-              width: "22px",
-              height: "22px",
-              borderRadius: "6px",
-              background: "linear-gradient(135deg, #6366f1, #8b5cf6)",
-              display: "flex",
-              alignItems: "center",
-              justifyContent: "center",
-              fontSize: "0.8rem",
-            }}
-          >
-            🧭
-          </div>
           <h1
             style={{
               margin: 0,
