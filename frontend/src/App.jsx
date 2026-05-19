@@ -144,6 +144,7 @@ function App() {
   const [routeInfo, setRouteInfo] = useState(null);
   const [routeMode, setRouteMode] = useState("normal");
   const [loading, setLoading] = useState(false);
+  const [routeError, setRouteError] = useState(null);
   const [showOrigin, setShowOrigin] = useState(false);
   const [isMobile, setIsMobile] = useState(
     typeof window !== "undefined" && window.innerWidth <= 640,
@@ -342,6 +343,7 @@ function App() {
     };
 
     setLoading(true);
+    setRouteError(null);
     try {
       const res = await fetch("/api/route", {
         method: "POST",
@@ -357,6 +359,9 @@ function App() {
         }),
       });
       const data = await res.json();
+      if (!res.ok || !data.trip?.legs?.[0]) {
+        throw new Error(data.error || "No route found between these points");
+      }
       const { length, time } = data.trip.summary;
       setRouteInfo({
         distance: length.toFixed(1),
@@ -391,6 +396,13 @@ function App() {
           ? { top: 240, bottom: 80, left: 40, right: 40 }
           : { top: 80, bottom: 80, left: 340, right: 80 },
       });
+    } catch (err) {
+      setRouteError(err.message || "Couldn't fetch route");
+      setRouteInfo(null);
+      if (map.current?.getSource("route")) {
+        map.current.removeLayer("route-line");
+        map.current.removeSource("route");
+      }
     } finally {
       setLoading(false);
     }
@@ -705,7 +717,25 @@ function App() {
           </button>
         )}
 
-        {(loading || routeInfo) && (
+        {routeError && (
+          <div
+            style={{
+              display: "flex",
+              alignItems: "center",
+              gap: "0.6rem",
+              padding: "0.6rem 0.75rem",
+              background: "rgba(239,68,68,0.1)",
+              border: "1px solid rgba(239,68,68,0.3)",
+              borderRadius: "10px",
+              color: "#fca5a5",
+              fontSize: "0.78rem",
+            }}
+          >
+            <span>⚠️</span>
+            <span style={{ flex: 1 }}>{routeError}</span>
+          </div>
+        )}
+        {(loading || routeInfo) && !routeError && (
           <div
             style={{
               display: "flex",
