@@ -520,7 +520,7 @@ function App() {
     });
 
     map.current.on("click", () => {
-      if (window.innerWidth <= 640) setMobileExpanded(true);
+      if (window.innerWidth <= 640) setMobileExpanded(false);
     });
 
     if (navigator.geolocation) {
