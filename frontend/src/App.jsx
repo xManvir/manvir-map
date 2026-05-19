@@ -959,7 +959,9 @@ function App() {
               setDestination(p);
               setDestQuery(p.name);
             }}
-            onClear={handleReset}
+            onClear={
+              routeMode === "scenic" && loading ? undefined : handleReset
+            }
           />
           {showOrigin && (
             <button
