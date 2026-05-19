@@ -150,7 +150,7 @@ const MODES = [
   },
 ];
 
-function SearchBox({ label, icon, value, onChange, onSelect, inputRef, onFocus: onFocusProp }) {
+function SearchBox({ label, icon, value, onChange, onSelect, onClear, inputRef, onFocus: onFocusProp }) {
   const [results, setResults] = useState([]);
   const [focused, setFocused] = useState(false);
 
@@ -214,8 +214,38 @@ function SearchBox({ label, icon, value, onChange, onSelect, inputRef, onFocus: 
             color: "#f3f4f6",
             fontSize: "0.9rem",
             fontFamily: "inherit",
+            minWidth: 0,
           }}
         />
+        {onClear && value && (
+          <button
+            type="button"
+            onMouseDown={(e) => e.preventDefault()}
+            onClick={() => {
+              setResults([]);
+              onClear();
+            }}
+            title="Clear"
+            style={{
+              background: "rgba(255,255,255,0.08)",
+              color: "rgba(255,255,255,0.7)",
+              border: "none",
+              borderRadius: "50%",
+              width: "18px",
+              height: "18px",
+              cursor: "pointer",
+              fontSize: "11px",
+              lineHeight: 1,
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "center",
+              flexShrink: 0,
+              padding: 0,
+            }}
+          >
+            ×
+          </button>
+        )}
       </div>
       {focused && results.length > 0 && (
         <ul
@@ -334,6 +364,9 @@ function App() {
       pitchWithRotate: false,
     });
 
+    map.current.scrollZoom.setZoomRate(1 / 50);
+    map.current.scrollZoom.setWheelZoomRate(1 / 200);
+
     const recenter = {
       onAdd: () => {
         const container = document.createElement("div");
@@ -355,7 +388,7 @@ function App() {
         const flyToUser = () => {
           if (userLocation.current) {
             const { lng, lat } = userLocation.current;
-            map.current?.flyTo({ center: [lng, lat], zoom: 15, duration: 800 });
+            map.current?.flyTo({ center: [lng, lat], zoom: 15, duration: 600 });
           } else if (navigator.geolocation) {
             navigator.geolocation.getCurrentPosition((pos) => {
               const { latitude: lat, longitude: lng } = pos.coords;
@@ -363,7 +396,7 @@ function App() {
               map.current?.flyTo({
                 center: [lng, lat],
                 zoom: 15,
-                duration: 800,
+                duration: 600,
               });
             });
           }
@@ -374,7 +407,7 @@ function App() {
               padding: window.innerWidth <= 640
                 ? { top: 120, bottom: 80, left: 40, right: 40 }
                 : { top: 80, bottom: 80, left: 340, right: 80 },
-              duration: 800,
+              duration: 600,
             });
             recenterTarget.current = "route";
           } else {
@@ -625,6 +658,7 @@ function App() {
         padding: isMobile
           ? { top: 240, bottom: 80, left: 40, right: 40 }
           : { top: 80, bottom: 80, left: 340, right: 80 },
+        duration: 600,
       });
     } catch (err) {
       setRouteError(err.message || "Couldn't fetch route");
@@ -664,7 +698,7 @@ function App() {
     map.current?.flyTo({
       center: home ? [home.lng, home.lat] : [-79.383184, 43.653226],
       zoom: home ? 15 : 9,
-      duration: 1000,
+      duration: 600,
     });
   }
 
@@ -733,51 +767,21 @@ function App() {
           overflow: "visible",
         }}
       >
-        {(!isMobile ||
-          origin?.isCurrent === false ||
-          destination) && (
+        {!isMobile && (
           <div
             style={{ display: "flex", alignItems: "center", gap: "0.5rem" }}
           >
-            {!isMobile && (
-              <h1
-                style={{
-                  margin: 0,
-                  fontSize: "0.9rem",
-                  fontWeight: 600,
-                  letterSpacing: "-0.01em",
-                  flex: 1,
-                }}
-              >
-                Manvir Maps
-              </h1>
-            )}
-            {(origin?.isCurrent === false || destination) && (
-            <button
-              onClick={handleReset}
-              title="Reset"
+            <h1
               style={{
-                background: "transparent",
-                color: "rgba(255,255,255,0.5)",
-                border: "none",
-                cursor: "pointer",
-                fontSize: "1rem",
-                padding: "0.15rem 0.4rem",
-                borderRadius: "6px",
-                lineHeight: 1,
-              }}
-              onMouseEnter={(e) => {
-                e.currentTarget.style.background = "rgba(255,255,255,0.08)";
-                e.currentTarget.style.color = "#ef4444";
-              }}
-              onMouseLeave={(e) => {
-                e.currentTarget.style.background = "transparent";
-                e.currentTarget.style.color = "rgba(255,255,255,0.5)";
+                margin: 0,
+                fontSize: "0.9rem",
+                fontWeight: 600,
+                letterSpacing: "-0.01em",
+                flex: 1,
               }}
             >
-              ✕
-            </button>
-            )}
+              Manvir Maps
+            </h1>
           </div>
         )}
 
@@ -955,6 +959,7 @@ function App() {
               setDestination(p);
               setDestQuery(p.name);
             }}
+            onClear={handleReset}
           />
           {showOrigin && (
             <button
@@ -1280,6 +1285,9 @@ function App() {
             max-height: 320px;
             opacity: 1;
             transform: translateY(0);
+          }
+          .maplibregl-ctrl-group:has(.maplibregl-ctrl-zoom-in) {
+            display: none !important;
           }
         }
       `}</style>
