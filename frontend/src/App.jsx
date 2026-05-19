@@ -2,6 +2,131 @@ import { useEffect, useRef, useState } from "react";
 import maplibregl from "maplibre-gl";
 import "maplibre-gl/dist/maplibre-gl.css";
 
+const DETOUR_LEVELS = {
+  light: { corridorKm: 4, maxWaypoints: 1, label: "Light" },
+  medium: { corridorKm: 10, maxWaypoints: 2, label: "Medium" },
+  heavy: { corridorKm: 22, maxWaypoints: 5, label: "Heavy" },
+};
+
+const SCENIC_FEATURE_WEIGHTS = {
+  viewpoint: 4,
+  scenic: 3.5,
+  national_park: 3,
+  water: 2,
+  park: 1.2,
+};
+
+function formatDuration(sec) {
+  const totalMin = Math.max(1, Math.round(sec / 60));
+  const days = Math.floor(totalMin / (60 * 24));
+  const hours = Math.floor((totalMin % (60 * 24)) / 60);
+  const mins = totalMin % 60;
+  const parts = [];
+  if (days) parts.push({ value: days, unit: "d" });
+  if (hours) parts.push({ value: hours, unit: "h" });
+  if (mins && !days) parts.push({ value: mins, unit: "min" });
+  return parts;
+}
+
+function toLocalMeters(lat, lng, refLat, refLng) {
+  const R = 6371000;
+  const x = (R * Math.cos((refLat * Math.PI) / 180) * (lng - refLng) * Math.PI) / 180;
+  const y = (R * (lat - refLat) * Math.PI) / 180;
+  return [x, y];
+}
+
+function projectOntoSegment(p, a, b) {
+  const dx = b[0] - a[0], dy = b[1] - a[1];
+  const lenSq = dx * dx + dy * dy;
+  if (lenSq === 0) return { dist: Math.hypot(p[0] - a[0], p[1] - a[1]), t: 0 };
+  const t = ((p[0] - a[0]) * dx + (p[1] - a[1]) * dy) / lenSq;
+  const tc = Math.max(0, Math.min(1, t));
+  const px = a[0] + tc * dx, py = a[1] + tc * dy;
+  return { dist: Math.hypot(p[0] - px, p[1] - py), t };
+}
+
+async function findScenicWaypoints(origin, dest, level) {
+  const { corridorKm, maxWaypoints } = DETOUR_LEVELS[level];
+  const pad = corridorKm / 111;
+  const south = Math.min(origin.lat, dest.lat) - pad;
+  const north = Math.max(origin.lat, dest.lat) + pad;
+  const west = Math.min(origin.lng, dest.lng) - pad;
+  const east = Math.max(origin.lng, dest.lng) + pad;
+  const bbox = `${south},${west},${north},${east}`;
+
+  const query = `
+[out:json][timeout:20];
+(
+  node["tourism"="viewpoint"](${bbox});
+  way["scenic"="yes"](${bbox});
+  way["leisure"="park"](${bbox});
+  rel["leisure"="park"](${bbox});
+  way["boundary"="national_park"](${bbox});
+  rel["boundary"="national_park"](${bbox});
+  way["natural"="water"](${bbox});
+);
+out center 300;
+`.trim();
+
+  let elements;
+  try {
+    const res = await fetch("https://overpass-api.de/api/interpreter", {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: "data=" + encodeURIComponent(query),
+    });
+    if (!res.ok) throw new Error("overpass " + res.status);
+    const json = await res.json();
+    elements = json.elements || [];
+  } catch {
+    return [];
+  }
+
+  const refLat = (origin.lat + dest.lat) / 2;
+  const refLng = (origin.lng + dest.lng) / 2;
+  const a = toLocalMeters(origin.lat, origin.lng, refLat, refLng);
+  const b = toLocalMeters(dest.lat, dest.lng, refLat, refLng);
+  const corridorM = corridorKm * 1000;
+  const minT = level === "heavy" ? 0.1 : 0.15;
+  const maxT = level === "heavy" ? 0.9 : 0.85;
+
+  const candidates = [];
+  for (const el of elements) {
+    const lat = el.lat ?? el.center?.lat;
+    const lng = el.lon ?? el.center?.lon;
+    if (lat == null || lng == null) continue;
+    const tags = el.tags || {};
+    let type;
+    if (tags.tourism === "viewpoint") type = "viewpoint";
+    else if (tags.scenic === "yes") type = "scenic";
+    else if (tags.boundary === "national_park") type = "national_park";
+    else if (tags.natural === "water") type = "water";
+    else if (tags.leisure === "park") type = "park";
+    else continue;
+
+    const p = toLocalMeters(lat, lng, refLat, refLng);
+    const { dist, t } = projectOntoSegment(p, a, b);
+    if (t < minT || t > maxT) continue;
+    if (dist > corridorM) continue;
+
+    const weight = SCENIC_FEATURE_WEIGHTS[type];
+    const score = weight / (1 + dist / 1500);
+    candidates.push({ lat, lng, type, dist, t, score, name: tags.name });
+  }
+
+  candidates.sort((x, y) => y.score - x.score);
+
+  const picked = [];
+  const minSpacing = level === "heavy" ? 0.13 : 0.25;
+  for (const c of candidates) {
+    if (picked.length >= maxWaypoints) break;
+    if (picked.some((p) => Math.abs(p.t - c.t) < minSpacing)) continue;
+    picked.push(c);
+  }
+  picked.sort((x, y) => x.t - y.t);
+  return picked;
+}
+
 const MODES = [
   {
     id: "normal",
@@ -60,6 +185,7 @@ function SearchBox({ label, icon, value, onChange, onSelect, inputRef }) {
   return (
     <div style={{ position: "relative" }}>
       <div
+        className="searchbox-wrap"
         style={{
           display: "flex",
           alignItems: "center",
@@ -144,8 +270,16 @@ function App() {
   const [routeInfo, setRouteInfo] = useState(null);
   const [routeMode, setRouteMode] = useState("normal");
   const [loading, setLoading] = useState(false);
+  const [loadingMsg, setLoadingMsg] = useState("Calculating route…");
   const [routeError, setRouteError] = useState(null);
   const [showOrigin, setShowOrigin] = useState(false);
+  const [detourLevel, setDetourLevel] = useState("medium");
+  const [prefs, setPrefs] = useState({
+    highways: true,
+    tolls: true,
+    ferries: true,
+  });
+  const scenicMarkers = useRef([]);
   const [isMobile, setIsMobile] = useState(
     typeof window !== "undefined" && window.innerWidth <= 640,
   );
@@ -318,23 +452,64 @@ function App() {
 
     if (origin && destination) fetchRoute(origin, destination);
     else clearRoute();
-  }, [origin, destination, routeMode]);
+  }, [origin, destination, routeMode, detourLevel, prefs]);
 
   function clearRoute() {
     if (map.current?.getSource("route")) {
       map.current.removeLayer("route-line");
       map.current.removeSource("route");
     }
+    scenicMarkers.current.forEach((m) => m.remove());
+    scenicMarkers.current = [];
     setRouteInfo(null);
   }
 
+  function clearScenicMarkers() {
+    scenicMarkers.current.forEach((m) => m.remove());
+    scenicMarkers.current = [];
+  }
+
+  function drawScenicMarkers(waypoints) {
+    clearScenicMarkers();
+    const icons = {
+      viewpoint: "👁",
+      scenic: "✦",
+      national_park: "🌲",
+      water: "💧",
+      park: "🌳",
+    };
+    waypoints.forEach((w) => {
+      const el = document.createElement("div");
+      el.title = w.name ? `${w.name} (${w.type})` : w.type;
+      el.style.cssText = `
+        width: 22px; height: 22px; border-radius: 50%;
+        background: rgba(34,197,94,0.95);
+        border: 2px solid white;
+        box-shadow: 0 2px 6px rgba(0,0,0,0.35);
+        display: flex; align-items: center; justify-content: center;
+        font-size: 11px; color: white; cursor: pointer;
+      `;
+      el.textContent = icons[w.type] || "·";
+      const marker = new maplibregl.Marker({ element: el })
+        .setLngLat([w.lng, w.lat])
+        .addTo(map.current);
+      scenicMarkers.current.push(marker);
+    });
+  }
+
   async function fetchRoute(o, d) {
-    const costingOptions = {
+    const baseCosting = {
       normal: {},
-      newDriver: {
-        auto: { use_highways: 0, use_tolls: 0, turn_penalty_factor: 100 },
-      },
-      scenic: { auto: { use_scenic: 1 } },
+      newDriver: { use_highways: 0, use_tolls: 0, turn_penalty_factor: 100 },
+      scenic: { use_living_streets: 0.7 },
+    };
+    const overrides = {
+      ...(prefs.highways ? {} : { use_highways: 0 }),
+      ...(prefs.tolls ? {} : { use_tolls: 0 }),
+      ...(prefs.ferries ? {} : { use_ferry: 0 }),
+    };
+    const costingOptions = {
+      [routeMode]: { auto: { ...baseCosting[routeMode], ...overrides } },
     };
     const routeColors = {
       normal: "#3b82f6",
@@ -345,14 +520,28 @@ function App() {
     setLoading(true);
     setRouteError(null);
     try {
+      let scenicWaypoints = [];
+      if (routeMode === "scenic") {
+        setLoadingMsg("Finding scenic detour…");
+        scenicWaypoints = await findScenicWaypoints(o, d, detourLevel);
+      }
+      setLoadingMsg("Calculating route…");
+
+      const locations = [
+        { lon: o.lng, lat: o.lat, radius: 10 },
+        ...scenicWaypoints.map((w) => ({
+          lon: w.lng,
+          lat: w.lat,
+          type: "through",
+        })),
+        { lon: d.lng, lat: d.lat, radius: 10 },
+      ];
+
       const res = await fetch("/api/route", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          locations: [
-            { lon: o.lng, lat: o.lat, radius: 10 },
-            { lon: d.lng, lat: d.lat, radius: 10 },
-          ],
+          locations,
           costing: "auto",
           costing_options: costingOptions[routeMode],
           directions_options: { units: "kilometres" },
@@ -365,10 +554,11 @@ function App() {
       const { length, time } = data.trip.summary;
       setRouteInfo({
         distance: length.toFixed(1),
-        duration: Math.round(time / 60),
+        durationSec: time,
+        waypointCount: scenicWaypoints.length,
       });
 
-      const coords = decodePolyline(data.trip.legs[0].shape);
+      const coords = data.trip.legs.flatMap((leg) => decodePolyline(leg.shape));
       if (map.current.getSource("route")) {
         map.current.removeLayer("route-line");
         map.current.removeSource("route");
@@ -387,6 +577,10 @@ function App() {
         layout: { "line-cap": "round", "line-join": "round" },
         paint: { "line-color": routeColors[routeMode], "line-width": 5 },
       });
+
+      if (routeMode === "scenic") drawScenicMarkers(scenicWaypoints);
+      else clearScenicMarkers();
+
       const bounds = coords.reduce(
         (b, c) => b.extend(c),
         new maplibregl.LngLatBounds(coords[0], coords[0]),
@@ -399,6 +593,7 @@ function App() {
     } catch (err) {
       setRouteError(err.message || "Couldn't fetch route");
       setRouteInfo(null);
+      clearScenicMarkers();
       if (map.current?.getSource("route")) {
         map.current.removeLayer("route-line");
         map.current.removeSource("route");
@@ -496,25 +691,32 @@ function App() {
           color: "#f3f4f6",
           display: "flex",
           flexDirection: "column",
-          padding: "0.85rem",
-          gap: "0.65rem",
+          padding: isMobile ? "0.5rem" : "0.85rem",
+          gap: isMobile ? "0.4rem" : "0.65rem",
           boxShadow: "0 12px 40px rgba(0,0,0,0.45), 0 2px 8px rgba(0,0,0,0.25)",
           overflow: "visible",
         }}
       >
-        <div style={{ display: "flex", alignItems: "center", gap: "0.5rem" }}>
-          <h1
-            style={{
-              margin: 0,
-              fontSize: "0.9rem",
-              fontWeight: 600,
-              letterSpacing: "-0.01em",
-              flex: 1,
-            }}
+        {(!isMobile ||
+          origin?.isCurrent === false ||
+          destination) && (
+          <div
+            style={{ display: "flex", alignItems: "center", gap: "0.5rem" }}
           >
-            Manvir Maps
-          </h1>
-          {(origin?.isCurrent === false || destination) && (
+            {!isMobile && (
+              <h1
+                style={{
+                  margin: 0,
+                  fontSize: "0.9rem",
+                  fontWeight: 600,
+                  letterSpacing: "-0.01em",
+                  flex: 1,
+                }}
+              >
+                Manvir Maps
+              </h1>
+            )}
+            {(origin?.isCurrent === false || destination) && (
             <button
               onClick={handleReset}
               title="Reset"
@@ -539,8 +741,9 @@ function App() {
             >
               ✕
             </button>
-          )}
-        </div>
+            )}
+          </div>
+        )}
 
         <div
           style={{
@@ -563,15 +766,15 @@ function App() {
                   background: active ? "rgba(255,255,255,0.08)" : "transparent",
                   border: "none",
                   borderRadius: "6px",
-                  padding: "0.4rem 0.3rem",
+                  padding: isMobile ? "0.3rem 0.2rem" : "0.4rem 0.3rem",
                   cursor: "pointer",
                   color: active ? m.color : "rgba(255,255,255,0.6)",
-                  fontSize: "0.72rem",
+                  fontSize: isMobile ? "0.68rem" : "0.72rem",
                   fontWeight: active ? 600 : 500,
                   display: "flex",
                   alignItems: "center",
                   justifyContent: "center",
-                  gap: "0.3rem",
+                  gap: "0.25rem",
                   transition: "all 0.15s",
                 }}
               >
@@ -581,6 +784,94 @@ function App() {
             );
           })}
         </div>
+
+        <div style={{ display: "flex", gap: "4px" }}>
+          {[
+            { id: "highways", icon: "🛣️", label: "Highways" },
+            { id: "tolls", icon: "💰", label: "Tolls" },
+            { id: "ferries", icon: "⛴️", label: "Ferries" },
+          ].map((opt) => {
+            const on = prefs[opt.id];
+            return (
+              <button
+                key={opt.id}
+                onClick={() =>
+                  setPrefs((p) => ({ ...p, [opt.id]: !p[opt.id] }))
+                }
+                title={`${on ? "Allow" : "Avoid"} ${opt.label.toLowerCase()}`}
+                style={{
+                  flex: 1,
+                  background: on
+                    ? "rgba(255,255,255,0.06)"
+                    : "rgba(239,68,68,0.08)",
+                  border: `1px solid ${on ? "rgba(255,255,255,0.08)" : "rgba(239,68,68,0.25)"}`,
+                  borderRadius: "6px",
+                  padding: isMobile ? "0.3rem 0.2rem" : "0.35rem 0.3rem",
+                  cursor: "pointer",
+                  color: on ? "rgba(255,255,255,0.75)" : "#fca5a5",
+                  fontSize: "0.68rem",
+                  fontWeight: 500,
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "center",
+                  gap: "0.25rem",
+                  textDecoration: on ? "none" : "line-through",
+                  textDecorationThickness: "1px",
+                }}
+              >
+                <span style={{ fontSize: "0.9rem", textDecoration: "none" }}>
+                  {opt.icon}
+                </span>
+                {!isMobile && opt.label}
+              </button>
+            );
+          })}
+        </div>
+
+        {routeMode === "scenic" && (
+          <div style={{ display: "flex", alignItems: "center", gap: "0.4rem" }}>
+            {!isMobile && (
+              <span style={{ fontSize: "0.7rem", opacity: 0.55, marginRight: "0.1rem" }}>
+                Detour
+              </span>
+            )}
+            <div
+              style={{
+                flex: 1,
+                display: "flex",
+                background: "rgba(255,255,255,0.04)",
+                borderRadius: "6px",
+                padding: "2px",
+                gap: "2px",
+              }}
+            >
+              {Object.entries(DETOUR_LEVELS).map(([id, cfg]) => {
+                const active = detourLevel === id;
+                return (
+                  <button
+                    key={id}
+                    onClick={() => setDetourLevel(id)}
+                    disabled={loading}
+                    style={{
+                      flex: 1,
+                      background: active ? "rgba(34,197,94,0.18)" : "transparent",
+                      border: "none",
+                      borderRadius: "4px",
+                      padding: "0.3rem 0.2rem",
+                      cursor: loading ? "not-allowed" : "pointer",
+                      color: active ? "#22c55e" : "rgba(255,255,255,0.55)",
+                      fontSize: "0.7rem",
+                      fontWeight: active ? 600 : 500,
+                      opacity: loading && !active ? 0.4 : 1,
+                    }}
+                  >
+                    {cfg.label}
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+        )}
 
         <div
           style={{
@@ -760,7 +1051,7 @@ function App() {
                   }}
                 />
                 <span style={{ fontSize: "0.78rem", opacity: 0.8 }}>
-                  Calculating route…
+                  {loadingMsg}
                 </span>
               </>
             ) : (
@@ -837,21 +1128,40 @@ function App() {
                       lineHeight: 1.1,
                     }}
                   >
-                    {routeInfo.duration}
-                    <span
-                      style={{
-                        fontSize: "0.7rem",
-                        opacity: 0.7,
-                        marginLeft: "2px",
-                        fontWeight: 500,
-                      }}
-                    >
-                      min
-                    </span>
+                    {formatDuration(routeInfo.durationSec).map((p, i) => (
+                      <span key={i} style={{ marginRight: "4px" }}>
+                        {p.value}
+                        <span
+                          style={{
+                            fontSize: "0.7rem",
+                            opacity: 0.7,
+                            marginLeft: "2px",
+                            fontWeight: 500,
+                          }}
+                        >
+                          {p.unit}
+                        </span>
+                      </span>
+                    ))}
                   </div>
                 </div>
               </>
             )}
+          </div>
+        )}
+
+        {routeInfo && !loading && routeMode === "scenic" && (
+          <div
+            style={{
+              fontSize: "0.7rem",
+              opacity: 0.6,
+              textAlign: "center",
+              marginTop: "-0.3rem",
+            }}
+          >
+            {routeInfo.waypointCount > 0
+              ? `via ${routeInfo.waypointCount} scenic stop${routeInfo.waypointCount > 1 ? "s" : ""}`
+              : "No scenic detours found — using back-road bias"}
           </div>
         )}
       </div>
@@ -891,6 +1201,7 @@ function App() {
         .maplibregl-ctrl-recenter:hover {
           color: #a5b4fc;
         }
+        .maplibregl-ctrl-attrib { display: none !important; }
         @media (max-width: 640px) {
           .maplibregl-ctrl-bottom-right {
             margin-right: 0.5rem !important;
@@ -898,6 +1209,7 @@ function App() {
           }
           .maplibregl-ctrl-group button { width: 42px !important; height: 42px !important; }
           input { font-size: 16px !important; }
+          .searchbox-wrap { padding: 0.45rem 0.6rem !important; }
         }
       `}</style>
     </div>
