@@ -45,7 +45,36 @@ function projectOntoSegment(p, a, b) {
   return { dist: Math.hypot(p[0] - px, p[1] - py), t };
 }
 
+function decodePolyline(encoded) {
+  let index = 0, lat = 0, lng = 0;
+  const coords = [];
+  while (index < encoded.length) {
+    let b, shift = 0, result = 0;
+    do {
+      b = encoded.charCodeAt(index++) - 63;
+      result |= (b & 0x1f) << shift;
+      shift += 5;
+    } while (b >= 0x20);
+    lat += result & 1 ? ~(result >> 1) : result >> 1;
+    shift = 0;
+    result = 0;
+    do {
+      b = encoded.charCodeAt(index++) - 63;
+      result |= (b & 0x1f) << shift;
+      shift += 5;
+    } while (b >= 0x20);
+    lng += result & 1 ? ~(result >> 1) : result >> 1;
+    coords.push([lng / 1e6, lat / 1e6]);
+  }
+  return coords;
+}
+
+const scenicCache = new Map();
+const SCENIC_CACHE_MAX = 32;
+
 async function findScenicWaypoints(origin, dest, level) {
+  const cacheKey = `${level}:${origin.lat.toFixed(3)},${origin.lng.toFixed(3)}->${dest.lat.toFixed(3)},${dest.lng.toFixed(3)}`;
+  if (scenicCache.has(cacheKey)) return scenicCache.get(cacheKey);
   const { corridorKm, maxWaypoints } = DETOUR_LEVELS[level];
   const pad = corridorKm / 111;
   const south = Math.min(origin.lat, dest.lat) - pad;
@@ -123,6 +152,10 @@ out center 300;
     picked.push(c);
   }
   picked.sort((x, y) => x.t - y.t);
+  if (scenicCache.size >= SCENIC_CACHE_MAX) {
+    scenicCache.delete(scenicCache.keys().next().value);
+  }
+  scenicCache.set(cacheKey, picked);
   return picked;
 }
 
@@ -150,22 +183,50 @@ const MODES = [
   },
 ];
 
-function SearchBox({ label, icon, value, onChange, onSelect, onClear, inputRef, onFocus: onFocusProp }) {
+function SearchBox({ label, icon, value, onChange, onSelect, onClear, inputRef, onFocus: onFocusProp, biasLat, biasLng }) {
   const [results, setResults] = useState([]);
   const [focused, setFocused] = useState(false);
+  const [highlight, setHighlight] = useState(-1);
+  const abortRef = useRef(null);
+  const debounceRef = useRef(null);
+  const reqIdRef = useRef(0);
 
-  async function handleChange(e) {
+  useEffect(() => () => {
+    if (debounceRef.current) clearTimeout(debounceRef.current);
+    abortRef.current?.abort();
+  }, []);
+
+  function runSearch(val) {
+    abortRef.current?.abort();
+    const ctrl = new AbortController();
+    abortRef.current = ctrl;
+    const myId = ++reqIdRef.current;
+    const bias = biasLat != null && biasLng != null
+      ? `&lat=${biasLat}&lon=${biasLng}`
+      : "";
+    fetch(`/photon/api?q=${encodeURIComponent(val)}&limit=5${bias}`, { signal: ctrl.signal })
+      .then((r) => r.json())
+      .then((data) => {
+        if (myId !== reqIdRef.current) return;
+        setResults(Array.isArray(data.features) ? data.features : []);
+        setHighlight(-1);
+      })
+      .catch((e) => {
+        if (e.name !== "AbortError") setResults([]);
+      });
+  }
+
+  function handleChange(e) {
     const val = e.target.value;
     onChange(val);
+    if (debounceRef.current) clearTimeout(debounceRef.current);
     if (val.length < 3) {
+      abortRef.current?.abort();
       setResults([]);
+      setHighlight(-1);
       return;
     }
-    const res = await fetch(
-      `/photon/api?q=${encodeURIComponent(val)}&limit=5&lat=43.7315&lon=-79.7624`,
-    );
-    const data = await res.json();
-    setResults(data.features);
+    debounceRef.current = setTimeout(() => runSearch(val), 200);
   }
 
   function formatName(props) {
@@ -178,7 +239,28 @@ function SearchBox({ label, icon, value, onChange, onSelect, onClear, inputRef, 
     const [lng, lat] = feature.geometry.coordinates;
     const name = formatName(feature.properties);
     setResults([]);
+    setHighlight(-1);
     onSelect({ lng, lat, name });
+  }
+
+  function handleKeyDown(e) {
+    if (!results.length) return;
+    if (e.key === "ArrowDown") {
+      e.preventDefault();
+      setHighlight((h) => (h + 1) % results.length);
+    } else if (e.key === "ArrowUp") {
+      e.preventDefault();
+      setHighlight((h) => (h <= 0 ? results.length - 1 : h - 1));
+    } else if (e.key === "Enter") {
+      const idx = highlight >= 0 ? highlight : 0;
+      if (results[idx]) {
+        e.preventDefault();
+        handleSelect(results[idx]);
+      }
+    } else if (e.key === "Escape") {
+      setResults([]);
+      setHighlight(-1);
+    }
   }
 
   return (
@@ -200,12 +282,16 @@ function SearchBox({ label, icon, value, onChange, onSelect, onClear, inputRef, 
           ref={inputRef}
           value={value}
           onChange={handleChange}
+          onKeyDown={handleKeyDown}
           onFocus={() => {
             setFocused(true);
             onFocusProp?.();
           }}
           onBlur={() => setTimeout(() => setFocused(false), 150)}
           placeholder={label}
+          aria-label={label}
+          autoComplete="off"
+          spellCheck="false"
           style={{
             flex: 1,
             background: "transparent",
@@ -226,6 +312,7 @@ function SearchBox({ label, icon, value, onChange, onSelect, onClear, inputRef, 
               onClear();
             }}
             title="Clear"
+            aria-label="Clear search"
             style={{
               background: "rgba(255,255,255,0.08)",
               color: "rgba(255,255,255,0.7)",
@@ -264,27 +351,36 @@ function SearchBox({ label, icon, value, onChange, onSelect, onClear, inputRef, 
             boxShadow: "0 8px 24px rgba(0,0,0,0.4)",
           }}
         >
-          {results.map((f, i) => (
-            <li
-              key={i}
-              onClick={() => handleSelect(f)}
-              style={{
-                padding: "0.5rem 0.6rem",
-                cursor: "pointer",
-                fontSize: "0.85rem",
-                color: "#e5e7eb",
-                borderRadius: "6px",
-              }}
-              onMouseEnter={(e) =>
-                (e.currentTarget.style.background = "rgba(255,255,255,0.06)")
-              }
-              onMouseLeave={(e) =>
-                (e.currentTarget.style.background = "transparent")
-              }
-            >
-              {formatName(f.properties)}
-            </li>
-          ))}
+          {results.map((f, i) => {
+            const [lng, lat] = f.geometry?.coordinates || [];
+            const coordStr = lat != null && lng != null
+              ? `${lat.toFixed(5)}, ${lng.toFixed(5)}`
+              : "";
+            return (
+              <li
+                key={f.properties?.osm_id ?? i}
+                title={coordStr}
+                onMouseDown={(e) => e.preventDefault()}
+                onClick={() => handleSelect(f)}
+                onMouseEnter={() => setHighlight(i)}
+                style={{
+                  padding: "0.5rem 0.6rem",
+                  cursor: "pointer",
+                  fontSize: "0.85rem",
+                  color: "#e5e7eb",
+                  borderRadius: "6px",
+                  background: highlight === i ? "rgba(255,255,255,0.08)" : "transparent",
+                }}
+              >
+                <div>{formatName(f.properties)}</div>
+                {coordStr && (
+                  <div style={{ fontSize: "0.68rem", opacity: 0.45, marginTop: "2px" }}>
+                    {coordStr}
+                  </div>
+                )}
+              </li>
+            );
+          })}
         </ul>
       )}
     </div>
@@ -312,6 +408,7 @@ function App() {
     ferries: true,
   });
   const [mobileExpanded, setMobileExpanded] = useState(false);
+  const [geoError, setGeoError] = useState(null);
   const scenicMarkers = useRef([]);
   const routeBounds = useRef(null);
   const recenterTarget = useRef("user");
@@ -344,23 +441,11 @@ function App() {
   useEffect(() => {
     if (map.current) return;
 
-    const cached = (() => {
-      try {
-        return JSON.parse(localStorage.getItem("lastLocation"));
-      } catch {
-        return null;
-      }
-    })();
-    const initialCenter = cached
-      ? [cached.lng, cached.lat]
-      : [-79.383184, 43.653226];
-    const initialZoom = cached ? 15 : 9;
-
     map.current = new maplibregl.Map({
       container: mapContainer.current,
       style: "https://tiles.openfreemap.org/styles/liberty",
-      center: initialCenter,
-      zoom: initialZoom,
+      center: [-79.383184, 43.653226],
+      zoom: 9,
       pitchWithRotate: false,
     });
 
@@ -439,14 +524,8 @@ function App() {
         async (pos) => {
           const { latitude: lat, longitude: lng } = pos.coords;
           userLocation.current = { lng, lat };
-          try {
-            localStorage.setItem("lastLocation", JSON.stringify({ lng, lat }));
-          } catch {}
-          if (!cached) {
-            map.current.jumpTo({ center: [lng, lat], zoom: 15 });
-          } else {
-            map.current.setCenter([lng, lat]);
-          }
+          setGeoError(null);
+          map.current.jumpTo({ center: [lng, lat], zoom: 15 });
 
           const el = document.createElement("div");
           el.style.cssText = `
@@ -463,13 +542,26 @@ function App() {
           setOrigin({ lng, lat, name, isCurrent: true });
           setOriginQuery(name);
         },
-        () => {},
+        (err) => {
+          if (err.code === err.PERMISSION_DENIED) {
+            setGeoError("Location access denied — set a starting point manually.");
+          } else if (err.code === err.TIMEOUT) {
+            setGeoError("Couldn't get your location — set a starting point manually.");
+          } else {
+            setGeoError("Location unavailable — set a starting point manually.");
+          }
+          setShowOrigin(true);
+        },
         { enableHighAccuracy: true, timeout: 8000 },
       );
+    } else {
+      setGeoError("Geolocation not supported — set a starting point manually.");
+      setShowOrigin(true);
     }
   }, []);
 
   useEffect(() => {
+    if (!map.current) return;
     markers.current.forEach((m) => m.remove());
     markers.current = [];
 
@@ -505,7 +597,10 @@ function App() {
         .addTo(map.current);
       markers.current.push(marker);
     });
+  }, [origin, destination]);
 
+  useEffect(() => {
+    if (!map.current) return;
     if (origin && destination) fetchRoute(origin, destination);
     else clearRoute();
   }, [origin, destination, routeMode, detourLevel, prefs]);
@@ -585,16 +680,16 @@ function App() {
       }
       setLoadingMsg("Calculating route…");
 
-      async function callValhalla(waypoints) {
+      async function callValhalla(waypoints, endpointRadius) {
         const locations = [
-          { lon: o.lng, lat: o.lat, radius: 10 },
+          { lon: o.lng, lat: o.lat, radius: endpointRadius },
           ...waypoints.map((w) => ({
             lon: w.lng,
             lat: w.lat,
             type: "through",
             radius: 2000,
           })),
-          { lon: d.lng, lat: d.lat, radius: 10 },
+          { lon: d.lng, lat: d.lat, radius: endpointRadius },
         ];
         const r = await fetch("/api/route", {
           method: "POST",
@@ -609,13 +704,20 @@ function App() {
         return { res: r, body: await r.json() };
       }
 
-      let { res, body: data } = await callValhalla(scenicWaypoints);
+      let { res, body: data } = await callValhalla(scenicWaypoints, 100);
       if ((!res.ok || !data.trip?.legs?.[0]) && scenicWaypoints.length > 0) {
         scenicWaypoints = [];
-        ({ res, body: data } = await callValhalla([]));
+        ({ res, body: data } = await callValhalla([], 100));
+      }
+      if (!res.ok && /no suitable edges|no edges? near/i.test(typeof data?.error === "string" ? data.error : "")) {
+        ({ res, body: data } = await callValhalla(scenicWaypoints, 1000));
       }
       if (!res.ok || !data.trip?.legs?.[0]) {
-        throw new Error(data.error || "No route found between these points");
+        const raw = typeof data?.error === "string" ? data.error : "";
+        const friendly = res.status >= 500 || /graphtile|out of bounds|assert|\.h:\d+/i.test(raw)
+          ? "Couldn't route to that location — try a nearby address."
+          : raw || "No route found between these points.";
+        throw new Error(friendly);
       }
       const { length, time } = data.trip.summary;
       setRouteInfo({
@@ -626,24 +728,26 @@ function App() {
       setMobileExpanded(false);
 
       const coords = data.trip.legs.flatMap((leg) => decodePolyline(leg.shape));
-      if (map.current.getSource("route")) {
-        map.current.removeLayer("route-line");
-        map.current.removeSource("route");
+      const geojson = {
+        type: "Feature",
+        geometry: { type: "LineString", coordinates: coords },
+      };
+      const existing = map.current.getSource("route");
+      if (existing) {
+        existing.setData(geojson);
+        if (map.current.getLayer("route-line")) {
+          map.current.setPaintProperty("route-line", "line-color", routeColors[routeMode]);
+        }
+      } else {
+        map.current.addSource("route", { type: "geojson", data: geojson });
+        map.current.addLayer({
+          id: "route-line",
+          type: "line",
+          source: "route",
+          layout: { "line-cap": "round", "line-join": "round" },
+          paint: { "line-color": routeColors[routeMode], "line-width": 5 },
+        });
       }
-      map.current.addSource("route", {
-        type: "geojson",
-        data: {
-          type: "Feature",
-          geometry: { type: "LineString", coordinates: coords },
-        },
-      });
-      map.current.addLayer({
-        id: "route-line",
-        type: "line",
-        source: "route",
-        layout: { "line-cap": "round", "line-join": "round" },
-        paint: { "line-color": routeColors[routeMode], "line-width": 5 },
-      });
 
       if (routeMode === "scenic") drawScenicMarkers(scenicWaypoints);
       else clearScenicMarkers();
@@ -684,50 +788,17 @@ function App() {
     setDestination(null);
     setDestQuery("");
     setRouteInfo(null);
-    setShowOrigin(false);
     const home = userLocation.current;
-    if (home) {
-      reverseGeocode(home.lat, home.lng).then((name) => {
-        setOrigin({ lng: home.lng, lat: home.lat, name, isCurrent: true });
-        setOriginQuery(name);
-      });
-    } else {
-      setOrigin(null);
-      setOriginQuery("");
-    }
+    const target = origin
+      ? [origin.lng, origin.lat]
+      : home
+      ? [home.lng, home.lat]
+      : [-79.383184, 43.653226];
     map.current?.flyTo({
-      center: home ? [home.lng, home.lat] : [-79.383184, 43.653226],
-      zoom: home ? 15 : 9,
+      center: target,
+      zoom: origin || home ? 15 : 9,
       duration: 600,
     });
-  }
-
-  function decodePolyline(encoded) {
-    let index = 0,
-      lat = 0,
-      lng = 0;
-    const coords = [];
-    while (index < encoded.length) {
-      let b,
-        shift = 0,
-        result = 0;
-      do {
-        b = encoded.charCodeAt(index++) - 63;
-        result |= (b & 0x1f) << shift;
-        shift += 5;
-      } while (b >= 0x20);
-      lat += result & 1 ? ~(result >> 1) : result >> 1;
-      shift = 0;
-      result = 0;
-      do {
-        b = encoded.charCodeAt(index++) - 63;
-        result |= (b & 0x1f) << shift;
-        shift += 5;
-      } while (b >= 0x20);
-      lng += result & 1 ? ~(result >> 1) : result >> 1;
-      coords.push([lng / 1e6, lat / 1e6]);
-    }
-    return coords;
   }
 
   const activeMode = MODES.find((m) => m.id === routeMode);
@@ -938,6 +1009,8 @@ function App() {
               label="Starting point"
               icon="🟢"
               value={originQuery}
+              biasLat={userLocation.current?.lat}
+              biasLng={userLocation.current?.lng}
               onFocus={() => setMobileExpanded(true)}
               onChange={(v) => {
                 setOriginQuery(v);
@@ -953,6 +1026,8 @@ function App() {
             label="Where to?"
             icon="🔴"
             value={destQuery}
+            biasLat={origin?.lat ?? userLocation.current?.lat}
+            biasLng={origin?.lng ?? userLocation.current?.lng}
             onFocus={() => setMobileExpanded(true)}
             onChange={setDestQuery}
             onSelect={(p) => {
@@ -1067,8 +1142,44 @@ function App() {
           </button>
         )}
 
+        {geoError && !origin && (
+          <div
+            role="status"
+            style={{
+              display: "flex",
+              alignItems: "center",
+              gap: "0.6rem",
+              padding: "0.5rem 0.7rem",
+              background: "rgba(245,158,11,0.1)",
+              border: "1px solid rgba(245,158,11,0.3)",
+              borderRadius: "10px",
+              color: "#fcd34d",
+              fontSize: "0.75rem",
+              order: isMobile ? 4 : 0,
+            }}
+          >
+            <span style={{ flex: 1 }}>{geoError}</span>
+            <button
+              type="button"
+              onClick={() => setGeoError(null)}
+              aria-label="Dismiss"
+              style={{
+                background: "transparent",
+                border: "none",
+                color: "inherit",
+                cursor: "pointer",
+                padding: 0,
+                fontSize: "0.9rem",
+                lineHeight: 1,
+              }}
+            >
+              ×
+            </button>
+          </div>
+        )}
         {routeError && (
           <div
+            role="alert"
             style={{
               display: "flex",
               alignItems: "center",
