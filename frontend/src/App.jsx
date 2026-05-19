@@ -450,13 +450,15 @@ function App() {
   return (
     <div
       style={{
-        position: "relative",
-        width: "100vw",
-        height: "100vh",
+        position: "fixed",
+        inset: 0,
         fontFamily: "-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif",
       }}
     >
-      <div ref={mapContainer} style={{ width: "100%", height: "100%" }} />
+      <div
+        ref={mapContainer}
+        style={{ position: "absolute", inset: 0 }}
+      />
 
       <div
         style={{
@@ -465,7 +467,7 @@ function App() {
           left: isMobile ? "0.5rem" : "1rem",
           right: isMobile ? "0.5rem" : "auto",
           width: isMobile ? "auto" : "300px",
-          maxHeight: isMobile ? "calc(100vh - 1rem)" : "calc(100vh - 2rem)",
+          maxHeight: isMobile ? "calc(100dvh - 1rem)" : "calc(100vh - 2rem)",
           background: "rgba(18, 18, 20, 0.72)",
           backdropFilter: "blur(28px) saturate(160%)",
           WebkitBackdropFilter: "blur(28px) saturate(160%)",
