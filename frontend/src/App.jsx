@@ -63,7 +63,6 @@ async function findScenicWaypoints(origin, dest, level) {
   rel["leisure"="park"](${bbox});
   way["boundary"="national_park"](${bbox});
   rel["boundary"="national_park"](${bbox});
-  way["natural"="water"](${bbox});
 );
 out center 300;
 `.trim();
@@ -151,7 +150,7 @@ const MODES = [
   },
 ];
 
-function SearchBox({ label, icon, value, onChange, onSelect, inputRef }) {
+function SearchBox({ label, icon, value, onChange, onSelect, inputRef, onFocus: onFocusProp }) {
   const [results, setResults] = useState([]);
   const [focused, setFocused] = useState(false);
 
@@ -201,7 +200,10 @@ function SearchBox({ label, icon, value, onChange, onSelect, inputRef }) {
           ref={inputRef}
           value={value}
           onChange={handleChange}
-          onFocus={() => setFocused(true)}
+          onFocus={() => {
+            setFocused(true);
+            onFocusProp?.();
+          }}
           onBlur={() => setTimeout(() => setFocused(false), 150)}
           placeholder={label}
           style={{
@@ -279,6 +281,7 @@ function App() {
     tolls: true,
     ferries: true,
   });
+  const [mobileExpanded, setMobileExpanded] = useState(false);
   const scenicMarkers = useRef([]);
   const [isMobile, setIsMobile] = useState(
     typeof window !== "undefined" && window.innerWidth <= 640,
@@ -377,6 +380,10 @@ function App() {
       }),
       "bottom-right",
     );
+
+    map.current.on("movestart", (e) => {
+      if (e.originalEvent) setMobileExpanded(false);
+    });
 
     if (navigator.geolocation) {
       navigator.geolocation.getCurrentPosition(
@@ -527,27 +534,35 @@ function App() {
       }
       setLoadingMsg("Calculating route…");
 
-      const locations = [
-        { lon: o.lng, lat: o.lat, radius: 10 },
-        ...scenicWaypoints.map((w) => ({
-          lon: w.lng,
-          lat: w.lat,
-          type: "through",
-        })),
-        { lon: d.lng, lat: d.lat, radius: 10 },
-      ];
+      async function callValhalla(waypoints) {
+        const locations = [
+          { lon: o.lng, lat: o.lat, radius: 10 },
+          ...waypoints.map((w) => ({
+            lon: w.lng,
+            lat: w.lat,
+            type: "through",
+            radius: 2000,
+          })),
+          { lon: d.lng, lat: d.lat, radius: 10 },
+        ];
+        const r = await fetch("/api/route", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            locations,
+            costing: "auto",
+            costing_options: costingOptions[routeMode],
+            directions_options: { units: "kilometres" },
+          }),
+        });
+        return { res: r, body: await r.json() };
+      }
 
-      const res = await fetch("/api/route", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          locations,
-          costing: "auto",
-          costing_options: costingOptions[routeMode],
-          directions_options: { units: "kilometres" },
-        }),
-      });
-      const data = await res.json();
+      let { res, body: data } = await callValhalla(scenicWaypoints);
+      if ((!res.ok || !data.trip?.legs?.[0]) && scenicWaypoints.length > 0) {
+        scenicWaypoints = [];
+        ({ res, body: data } = await callValhalla([]));
+      }
       if (!res.ok || !data.trip?.legs?.[0]) {
         throw new Error(data.error || "No route found between these points");
       }
@@ -557,6 +572,7 @@ function App() {
         durationSec: time,
         waypointCount: scenicWaypoints.length,
       });
+      setMobileExpanded(false);
 
       const coords = data.trip.legs.flatMap((leg) => decodePolyline(leg.shape));
       if (map.current.getSource("route")) {
@@ -746,6 +762,16 @@ function App() {
         )}
 
         <div
+          className="mobile-collapsible"
+          data-expanded={mobileExpanded ? "true" : "false"}
+          style={{
+            display: "flex",
+            flexDirection: "column",
+            gap: isMobile ? "0.4rem" : "0.65rem",
+            order: isMobile ? 3 : 0,
+          }}
+        >
+        <div
           style={{
             display: "flex",
             background: "rgba(255,255,255,0.04)",
@@ -872,6 +898,7 @@ function App() {
             </div>
           </div>
         )}
+        </div>
 
         <div
           style={{
@@ -879,6 +906,7 @@ function App() {
             display: "flex",
             flexDirection: "column",
             gap: "0.4rem",
+            order: isMobile ? 1 : 0,
           }}
         >
           {showOrigin && (
@@ -886,6 +914,7 @@ function App() {
               label="Starting point"
               icon="🟢"
               value={originQuery}
+              onFocus={() => setMobileExpanded(true)}
               onChange={(v) => {
                 setOriginQuery(v);
                 if (origin?.isCurrent) setOrigin(null);
@@ -900,6 +929,7 @@ function App() {
             label="Where to?"
             icon="🔴"
             value={destQuery}
+            onFocus={() => setMobileExpanded(true)}
             onChange={setDestQuery}
             onSelect={(p) => {
               setDestination(p);
@@ -943,6 +973,7 @@ function App() {
               gap: "0.4rem",
               fontSize: "0.72rem",
               opacity: 0.75,
+              order: isMobile ? 2 : 0,
             }}
           >
             <span
@@ -1002,6 +1033,7 @@ function App() {
               padding: 0,
               textAlign: "left",
               alignSelf: "flex-start",
+              order: isMobile ? 2 : 0,
             }}
           >
             ← Use my current location
@@ -1020,6 +1052,7 @@ function App() {
               borderRadius: "10px",
               color: "#fca5a5",
               fontSize: "0.78rem",
+              order: isMobile ? 4 : 0,
             }}
           >
             <span>⚠️</span>
@@ -1031,11 +1064,12 @@ function App() {
             style={{
               display: "flex",
               alignItems: "center",
-              gap: "0.75rem",
-              padding: "0.6rem 0.75rem",
+              gap: "0.5rem",
+              padding: "0.4rem 0.6rem",
+              order: isMobile ? 4 : 0,
               background: "rgba(255,255,255,0.04)",
               border: "1px solid rgba(255,255,255,0.06)",
-              borderRadius: "10px",
+              borderRadius: "8px",
             }}
           >
             {loading ? (
@@ -1066,7 +1100,7 @@ function App() {
                 >
                   <div
                     style={{
-                      fontSize: "0.62rem",
+                      fontSize: "0.55rem",
                       opacity: 0.5,
                       textTransform: "uppercase",
                       letterSpacing: "0.06em",
@@ -1076,7 +1110,7 @@ function App() {
                   </div>
                   <div
                     style={{
-                      fontSize: "1rem",
+                      fontSize: "0.78rem",
                       fontWeight: 700,
                       color: activeMode.color,
                       lineHeight: 1.1,
@@ -1085,7 +1119,7 @@ function App() {
                     {routeInfo.distance}
                     <span
                       style={{
-                        fontSize: "0.7rem",
+                        fontSize: "0.58rem",
                         opacity: 0.7,
                         marginLeft: "2px",
                         fontWeight: 500,
@@ -1112,7 +1146,7 @@ function App() {
                 >
                   <div
                     style={{
-                      fontSize: "0.62rem",
+                      fontSize: "0.55rem",
                       opacity: 0.5,
                       textTransform: "uppercase",
                       letterSpacing: "0.06em",
@@ -1122,7 +1156,7 @@ function App() {
                   </div>
                   <div
                     style={{
-                      fontSize: "1rem",
+                      fontSize: "0.78rem",
                       fontWeight: 700,
                       color: activeMode.color,
                       lineHeight: 1.1,
@@ -1210,6 +1244,23 @@ function App() {
           .maplibregl-ctrl-group button { width: 42px !important; height: 42px !important; }
           input { font-size: 16px !important; }
           .searchbox-wrap { padding: 0.45rem 0.6rem !important; }
+          .mobile-collapsible {
+            overflow: hidden;
+            transition: max-height 0.25s ease, opacity 0.18s ease, transform 0.22s ease;
+            transform-origin: top center;
+          }
+          .mobile-collapsible[data-expanded="false"] {
+            max-height: 0 !important;
+            opacity: 0;
+            transform: translateY(-8px);
+            pointer-events: none;
+            gap: 0 !important;
+          }
+          .mobile-collapsible[data-expanded="true"] {
+            max-height: 320px;
+            opacity: 1;
+            transform: translateY(0);
+          }
         }
       `}</style>
     </div>
