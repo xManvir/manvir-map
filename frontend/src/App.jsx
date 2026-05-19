@@ -1388,20 +1388,29 @@ function App() {
           .searchbox-wrap { padding: 0.45rem 0.6rem !important; }
           .mobile-collapsible {
             overflow: hidden;
-            transition: max-height 0.25s ease, opacity 0.18s ease, transform 0.22s ease;
+            transition:
+              max-height 0.34s cubic-bezier(0.32, 0.72, 0, 1),
+              opacity 0.22s cubic-bezier(0.32, 0.72, 0, 1),
+              transform 0.34s cubic-bezier(0.32, 0.72, 0, 1),
+              margin-top 0.34s cubic-bezier(0.32, 0.72, 0, 1);
             transform-origin: top center;
+            will-change: max-height, opacity, transform;
           }
           .mobile-collapsible[data-expanded="false"] {
             max-height: 0 !important;
             opacity: 0;
-            transform: translateY(-8px);
+            transform: translateY(-6px) scaleY(0.98);
             pointer-events: none;
             gap: 0 !important;
+            margin-top: -0.4rem;
           }
           .mobile-collapsible[data-expanded="true"] {
-            max-height: 320px;
+            max-height: 360px;
             opacity: 1;
-            transform: translateY(0);
+            transform: translateY(0) scaleY(1);
+          }
+          @media (prefers-reduced-motion: reduce) {
+            .mobile-collapsible { transition: none; }
           }
           .maplibregl-ctrl-group:has(.maplibregl-ctrl-zoom-in) {
             display: none !important;
