@@ -283,6 +283,8 @@ function App() {
   });
   const [mobileExpanded, setMobileExpanded] = useState(false);
   const scenicMarkers = useRef([]);
+  const routeBounds = useRef(null);
+  const recenterTarget = useRef("user");
   const [isMobile, setIsMobile] = useState(
     typeof window !== "undefined" && window.innerWidth <= 640,
   );
@@ -350,7 +352,7 @@ function App() {
             <line x1="19.5" y1="12" x2="22.5" y2="12" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
           </svg>
         `;
-        btn.onclick = () => {
+        const flyToUser = () => {
           if (userLocation.current) {
             const { lng, lat } = userLocation.current;
             map.current?.flyTo({ center: [lng, lat], zoom: 15, duration: 800 });
@@ -364,6 +366,20 @@ function App() {
                 duration: 800,
               });
             });
+          }
+        };
+        btn.onclick = () => {
+          if (routeBounds.current && recenterTarget.current === "user") {
+            map.current?.fitBounds(routeBounds.current, {
+              padding: window.innerWidth <= 640
+                ? { top: 120, bottom: 80, left: 40, right: 40 }
+                : { top: 80, bottom: 80, left: 340, right: 80 },
+              duration: 800,
+            });
+            recenterTarget.current = "route";
+          } else {
+            flyToUser();
+            recenterTarget.current = "user";
           }
         };
         container.appendChild(btn);
@@ -468,6 +484,8 @@ function App() {
     }
     scenicMarkers.current.forEach((m) => m.remove());
     scenicMarkers.current = [];
+    routeBounds.current = null;
+    recenterTarget.current = "user";
     setRouteInfo(null);
   }
 
@@ -601,6 +619,8 @@ function App() {
         (b, c) => b.extend(c),
         new maplibregl.LngLatBounds(coords[0], coords[0]),
       );
+      routeBounds.current = bounds;
+      recenterTarget.current = "route";
       map.current.fitBounds(bounds, {
         padding: isMobile
           ? { top: 240, bottom: 80, left: 40, right: 40 }
