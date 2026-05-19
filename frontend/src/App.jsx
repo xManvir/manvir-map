@@ -404,12 +404,20 @@ function App() {
   }
 
   function handleReset() {
-    setOrigin(null);
     setDestination(null);
-    setOriginQuery("");
     setDestQuery("");
     setRouteInfo(null);
+    setShowOrigin(false);
     const home = userLocation.current;
+    if (home) {
+      reverseGeocode(home.lat, home.lng).then((name) => {
+        setOrigin({ lng: home.lng, lat: home.lat, name, isCurrent: true });
+        setOriginQuery(name);
+      });
+    } else {
+      setOrigin(null);
+      setOriginQuery("");
+    }
     map.current?.flyTo({
       center: home ? [home.lng, home.lat] : [-79.383184, 43.653226],
       zoom: home ? 15 : 9,
