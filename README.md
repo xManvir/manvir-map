@@ -1,6 +1,8 @@
 # Manvir Map 🗺️
 
-A fully self-hosted routing and geocoding web app — no Google Maps, no Mapbox, no API keys.
+A self-hosted routing and geocoding web app — no Google Maps, no Mapbox, no API keys.
+
+Routing (Valhalla) and address search (Photon) run locally. Base map tiles come from the free [OpenFreeMap](https://openfreemap.org/) project, and scenic-route discovery queries the public [Overpass API](https://overpass-api.de/) — both can be swapped for self-hosted alternatives.
 
 **Live demo: [map.manvir.stream](https://map.manvir.stream)**
 
