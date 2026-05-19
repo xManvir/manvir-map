@@ -5,3 +5,5 @@ ontario-latest.osm.pbf
 node_modules/
 frontend/dist/
 *.tar.bz2
+.claude/
+CLAUDE.md
