@@ -852,7 +852,10 @@ function App() {
           color: #a5b4fc;
         }
         @media (max-width: 640px) {
-          .maplibregl-ctrl-bottom-right { margin-right: 0.5rem !important; margin-bottom: 0.5rem !important; }
+          .maplibregl-ctrl-bottom-right {
+            margin-right: 0.5rem !important;
+            margin-bottom: calc(0.5rem + env(safe-area-inset-bottom, 0px)) !important;
+          }
           .maplibregl-ctrl-group button { width: 42px !important; height: 42px !important; }
           input { font-size: 16px !important; }
         }
