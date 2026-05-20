@@ -115,22 +115,29 @@ function projectOntoSegment(p, a, b) {
 function decodePolyline(encoded) {
   let index = 0, lat = 0, lng = 0;
   const coords = [];
-  while (index < encoded.length) {
+  const len = encoded.length;
+  while (index < len) {
     let b, shift = 0, result = 0;
-    // Decode latitude delta.
+    // Decode latitude delta. Bounds-check `index` and cap `shift` so a
+    // truncated or malformed polyline can never spin into an infinite loop
+    // — return whatever we've decoded so far.
     do {
+      if (index >= len) return coords;
       b = encoded.charCodeAt(index++) - 63;
       result |= (b & 0x1f) << shift;
       shift += 5;
+      if (shift > 35) return coords;
     } while (b >= 0x20);
     lat += result & 1 ? ~(result >> 1) : result >> 1;
-    // Decode longitude delta.
+    // Decode longitude delta. Same guards as above.
     shift = 0;
     result = 0;
     do {
+      if (index >= len) return coords;
       b = encoded.charCodeAt(index++) - 63;
       result |= (b & 0x1f) << shift;
       shift += 5;
+      if (shift > 35) return coords;
     } while (b >= 0x20);
     lng += result & 1 ? ~(result >> 1) : result >> 1;
     // MapLibre wants [lng, lat]; precision is 1e-6 because Valhalla uses
@@ -167,7 +174,7 @@ const SCENIC_CACHE_MAX = 32;
 //   - We enforce a minimum spacing along the segment so we don't pick 5 parks
 //     all clustered in the same town.
 // -----------------------------------------------------------------------------
-async function findScenicWaypoints(origin, dest, level) {
+async function findScenicWaypoints(origin, dest, level, signal) {
   // Cache key includes the level (corridor width) and rounded coords so trips
   // that start "basically here" reuse the same result.
   const cacheKey = `${level}:${origin.lat.toFixed(3)},${origin.lng.toFixed(3)}->${dest.lat.toFixed(3)},${dest.lng.toFixed(3)}`;
@@ -207,11 +214,15 @@ out center 300;
       method: "POST",
       headers: { "Content-Type": "application/x-www-form-urlencoded" },
       body: "data=" + encodeURIComponent(query),
+      signal,
     });
     if (!res.ok) throw new Error("overpass " + res.status);
     const json = await res.json();
     elements = json.elements || [];
-  } catch {
+  } catch (e) {
+    // Caller aborted (e.g. newer request superseded this one) — rethrow so
+    // the calling fetchRoute can bail before touching state.
+    if (e?.name === "AbortError") throw e;
     // Network or server error — silently fall back to "no detours" so the
     // main route still gets calculated.
     return [];
@@ -357,8 +368,12 @@ function SearchBox({ label, icon, value, onChange, onSelect, onClear, inputRef, 
     abortRef.current = ctrl;
     const myId = ++reqIdRef.current;
     // Photon supports `lat`/`lon` for biasing search results toward a point.
-    const bias = biasLat != null && biasLng != null
-      ? `&lat=${biasLat}&lon=${biasLng}`
+    // Defense-in-depth: coerce to Number so any non-numeric prop value can't
+    // smuggle extra query-string syntax (`&foo=bar`) into the URL.
+    const bLat = Number(biasLat);
+    const bLng = Number(biasLng);
+    const bias = Number.isFinite(bLat) && Number.isFinite(bLng)
+      ? `&lat=${bLat}&lon=${bLng}`
       : "";
     fetch(`/photon/api?q=${encodeURIComponent(val)}&limit=5${bias}`, { signal: ctrl.signal })
       .then((r) => r.json())
@@ -613,6 +628,38 @@ function App() {
   // What the recenter button should fly to next: "user" or "route".
   // Toggles each time the button is pressed.
   const recenterTarget = useRef("user");
+  // ---- async race protection refs -----------------------------------------
+  // Monotonic counter for fetchRoute calls. We compare against the value at
+  // call-time before applying state so a late-resolving stale fetch can't
+  // overwrite the UI with a wrong route.
+  const routeReqIdRef = useRef(0);
+  // AbortController for the currently in-flight route+overpass request set.
+  const routeAbortRef = useRef(null);
+  // Pending debounce timer for the route effect (collapses rapid pref/mode
+  // toggles into a single Valhalla call).
+  const routeDebounceRef = useRef(null);
+  // Becomes true the first time the user types/clears in the origin input
+  // (or selects a result). Initial reverse-geocode refuses to write origin
+  // state once this is set, so user input is never clobbered by a late
+  // geolocation resolve.
+  const originTouchedRef = useRef(false);
+  // Endpoint signature of the last route we actually drew, so we can tell
+  // whether the current fetchRoute is a brand-new trip (collapse the mobile
+  // panel to show the map) or a refetch triggered by a pref/mode toggle
+  // (leave the panel alone so the user can keep tweaking).
+  const lastRouteEndpointsRef = useRef("");
+
+  // ---------------------------------------------------------------------------
+  // abortRoute — cancel any in-flight fetchRoute AND invalidate its request
+  // id so the catch handler treats the abort as "superseded" (silent) rather
+  // than as a timeout. Call this from any code path that wants to throw away
+  // the current route fetch (handleReset, clearing endpoints, etc.).
+  // ---------------------------------------------------------------------------
+  function abortRoute() {
+    routeAbortRef.current?.abort();
+    // Bumping the id means stillCurrent() in any pending catch returns false.
+    routeReqIdRef.current++;
+  }
 
   // Mobile vs desktop layout flag, driven by viewport width.
   const [isMobile, setIsMobile] = useState(
@@ -698,22 +745,29 @@ function App() {
             <line x1="19.5" y1="12" x2="22.5" y2="12" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
           </svg>
         `;
-        // Helper: fly the camera to the user's geolocation, requesting it
-        // fresh if we haven't yet captured it.
+        // Helper: fly the camera to the user's geolocation. Always asks for
+        // a fresh position if the geolocation API is available, so the dot
+        // tracks them if they've moved since page load. Falls back to the
+        // cached value (or does nothing) if the API is unavailable or
+        // permission was denied.
         const flyToUser = () => {
-          if (userLocation.current) {
-            const { lng, lat } = userLocation.current;
+          const useCoords = (lng, lat) => {
+            userLocation.current = { lng, lat };
             map.current?.flyTo({ center: [lng, lat], zoom: 15, duration: 600 });
-          } else if (navigator.geolocation) {
-            navigator.geolocation.getCurrentPosition((pos) => {
-              const { latitude: lat, longitude: lng } = pos.coords;
-              userLocation.current = { lng, lat };
-              map.current?.flyTo({
-                center: [lng, lat],
-                zoom: 15,
-                duration: 600,
-              });
-            });
+          };
+          if (navigator.geolocation) {
+            navigator.geolocation.getCurrentPosition(
+              (pos) => useCoords(pos.coords.longitude, pos.coords.latitude),
+              () => {
+                // Permission denied or timeout — fall back to last known.
+                if (userLocation.current) {
+                  useCoords(userLocation.current.lng, userLocation.current.lat);
+                }
+              },
+              { enableHighAccuracy: true, timeout: 5000 },
+            );
+          } else if (userLocation.current) {
+            useCoords(userLocation.current.lng, userLocation.current.lat);
           }
         };
         btn.onclick = () => {
@@ -785,6 +839,10 @@ function App() {
 
           // Reverse-geocode for a friendly origin label.
           const name = await reverseGeocode(lat, lng);
+          // Bail if the user has already interacted with the origin input
+          // while we were waiting on Photon. Otherwise we would overwrite
+          // their typed/selected origin with the geolocation result.
+          if (originTouchedRef.current) return;
           // `isCurrent` flag lets later code know this origin came from
           // geolocation (so we suppress its pin and clear it if the user
           // starts typing a new origin).
@@ -870,11 +928,26 @@ function App() {
   // Routing trigger — whenever either endpoint, the mode, the detour level,
   // or the preference toggles change, refetch the route. If either endpoint
   // is missing, clear any drawn route instead.
+  //
+  // Debounced 150ms so rapid pref-button mashing collapses into a single
+  // Valhalla call instead of firing one per click.
   // ---------------------------------------------------------------------------
   useEffect(() => {
     if (!map.current) return;
-    if (origin && destination) fetchRoute(origin, destination);
-    else clearRoute();
+    if (routeDebounceRef.current) clearTimeout(routeDebounceRef.current);
+    if (!origin || !destination) {
+      // Cancel any in-flight request (and invalidate its id) before clearing
+      // so a late resolve from the aborted call can't redraw a stale route.
+      abortRoute();
+      clearRoute();
+      return;
+    }
+    routeDebounceRef.current = setTimeout(() => {
+      fetchRoute(origin, destination);
+    }, 150);
+    return () => {
+      if (routeDebounceRef.current) clearTimeout(routeDebounceRef.current);
+    };
   }, [origin, destination, routeMode, detourLevel, prefs]);
 
   // ---------------------------------------------------------------------------
@@ -890,6 +963,9 @@ function App() {
     scenicMarkers.current = [];
     routeBounds.current = null;
     recenterTarget.current = "user";
+    // Forget the last endpoint signature so re-entering the same trip
+    // after a reset counts as "brand new" and re-collapses the mobile panel.
+    lastRouteEndpointsRef.current = "";
     setRouteInfo(null);
   }
 
@@ -949,6 +1025,31 @@ function App() {
   //   5. Decode the polyline, render as a line layer, fit bounds.
   // ---------------------------------------------------------------------------
   async function fetchRoute(o, d) {
+    // ---- abort any in-flight request, then start a fresh tracking session
+    // (request id + AbortController + 25s client-side timeout). Late
+    // resolves from a superseded fetch are detected via myId mismatch and
+    // dropped without touching React state.
+    //
+    // Note: we call abort() directly here instead of abortRoute() because
+    // we're about to assign a brand-new id ourselves via ++routeReqIdRef;
+    // abortRoute() would bump it once more and de-sync.
+    routeAbortRef.current?.abort();
+    const ctrl = new AbortController();
+    routeAbortRef.current = ctrl;
+    const myId = ++routeReqIdRef.current;
+    // Helper: true only while THIS fetchRoute call is still the latest one.
+    const stillCurrent = () => myId === routeReqIdRef.current;
+    // Distinguish "we aborted because of our own 25s timeout" from "aborted
+    // because someone superseded us". A timeout still owns the UI and
+    // should show an error; a supersession should stay silent.
+    let timedOut = false;
+    // 25s wall-clock cap — beyond this we abort even if the network hasn't
+    // errored, so the spinner can never get stuck forever.
+    const timeoutId = setTimeout(() => {
+      timedOut = true;
+      ctrl.abort();
+    }, 25000);
+
     // Mode-specific Valhalla costing tuning. These keys are documented in
     // the Valhalla "auto" costing options.
     const baseCosting = {
@@ -980,8 +1081,9 @@ function App() {
       let scenicWaypoints = [];
       if (routeMode === "scenic") {
         setLoadingMsg("Finding scenic detour…");
-        scenicWaypoints = await findScenicWaypoints(o, d, detourLevel);
+        scenicWaypoints = await findScenicWaypoints(o, d, detourLevel, ctrl.signal);
       }
+      if (!stillCurrent()) return;
       setLoadingMsg("Calculating route…");
 
       // Inner helper that builds + POSTs the Valhalla request. `endpointRadius`
@@ -1011,23 +1113,27 @@ function App() {
             costing_options: costingOptions[routeMode],
             directions_options: { units: "kilometres" },
           }),
+          signal: ctrl.signal,
         });
         return { res: r, body: await r.json() };
       }
 
       // First attempt: include scenic waypoints (if any), tight snap radius.
       let { res, body: data } = await callValhalla(scenicWaypoints, 100);
+      if (!stillCurrent()) return;
 
       // Fallback 1: if Valhalla failed and we had waypoints, retry without
       // them. Some waypoints just can't be routed through.
       if ((!res.ok || !data.trip?.legs?.[0]) && scenicWaypoints.length > 0) {
         scenicWaypoints = [];
         ({ res, body: data } = await callValhalla([], 100));
+        if (!stillCurrent()) return;
       }
       // Fallback 2: if Valhalla complains about "no suitable edges", retry
       // with a much bigger snap radius so it can find *any* routable road.
       if (!res.ok && /no suitable edges|no edges? near/i.test(typeof data?.error === "string" ? data.error : "")) {
         ({ res, body: data } = await callValhalla(scenicWaypoints, 1000));
+        if (!stillCurrent()) return;
       }
       // If we still don't have a usable trip, surface a friendly error.
       if (!res.ok || !data.trip?.legs?.[0]) {
@@ -1047,12 +1153,22 @@ function App() {
         durationSec: time,
         waypointCount: scenicWaypoints.length,
       });
-      // Auto-collapse the mobile panel once we have a result so the user
-      // can see the route immediately.
-      setMobileExpanded(false);
+      // Auto-collapse the mobile panel ONLY when the endpoints just changed
+      // (a brand-new trip), not on a pref/mode refetch — otherwise tweaking
+      // toggles yanks the panel closed under the user's finger.
+      const endpointSig = `${o.lng.toFixed(6)},${o.lat.toFixed(6)}->${d.lng.toFixed(6)},${d.lat.toFixed(6)}`;
+      if (endpointSig !== lastRouteEndpointsRef.current) {
+        setMobileExpanded(false);
+        lastRouteEndpointsRef.current = endpointSig;
+      }
 
       // Decode each leg and concatenate into one continuous coord array.
       const coords = data.trip.legs.flatMap((leg) => decodePolyline(leg.shape));
+      // Defensive: if decoding produced nothing usable, bail with a clean
+      // error instead of crashing on the empty-bounds path below.
+      if (coords.length === 0) {
+        throw new Error("Route returned no geometry.");
+      }
       const geojson = {
         type: "Feature",
         geometry: { type: "LineString", coordinates: coords },
@@ -1097,8 +1213,17 @@ function App() {
         duration: 600,
       });
     } catch (err) {
-      // Any failure: show the message, drop the route, drop scenic markers.
-      setRouteError(err.message || "Couldn't fetch route");
+      // Supersession: a newer fetchRoute (or abortRoute) invalidated our
+      // id. The newer call (or the reset that cancelled us) owns the UI —
+      // stay completely silent here.
+      if (!stillCurrent()) return;
+      // From here on, we're still the live request. An AbortError can only
+      // come from our own 25s timeout, since any other cancel path would
+      // have bumped the id first via abortRoute().
+      const msg = (err?.name === "AbortError" || timedOut)
+        ? "Route request timed out — try again."
+        : err.message || "Couldn't fetch route";
+      setRouteError(msg);
       setRouteInfo(null);
       clearScenicMarkers();
       if (map.current?.getSource("route")) {
@@ -1106,7 +1231,10 @@ function App() {
         map.current.removeSource("route");
       }
     } finally {
-      setLoading(false);
+      clearTimeout(timeoutId);
+      // Only the latest in-flight request should toggle the spinner off,
+      // otherwise a stale finally{} can hide the spinner of the live one.
+      if (stillCurrent()) setLoading(false);
     }
   }
 
@@ -1127,9 +1255,16 @@ function App() {
   // view, in that priority order.
   // ---------------------------------------------------------------------------
   function handleReset() {
+    // Cancel any in-flight route fetch AND invalidate its id so its late
+    // catch handler treats the abort as "superseded" (silent) rather than
+    // as a timeout, and can't redraw a route we just cleared.
+    abortRoute();
     setDestination(null);
     setDestQuery("");
     setRouteInfo(null);
+    // Clear any error banner left over from the prior route — otherwise the
+    // red banner persists with no route on screen and confuses the user.
+    setRouteError(null);
     const home = userLocation.current;
     const target = origin
       ? [origin.lng, origin.lat]
@@ -1397,12 +1532,16 @@ function App() {
               biasLng={userLocation.current?.lng}
               onFocus={() => setMobileExpanded(true)}
               onChange={(v) => {
+                // Mark origin as user-touched so a late initial reverse-
+                // geocode resolve can't clobber what they're typing.
+                originTouchedRef.current = true;
                 setOriginQuery(v);
                 // Once the user starts editing, drop the geolocation origin
                 // so we don't keep their old position around in state.
                 if (origin?.isCurrent) setOrigin(null);
               }}
               onSelect={(p) => {
+                originTouchedRef.current = true;
                 setOrigin(p);
                 setOriginQuery(p.name);
               }}
@@ -1749,103 +1888,9 @@ function App() {
         )}
       </div>
 
-      {/* ===================================================================
-          Embedded <style> block — global CSS that JSX inline styles can't
-          express:
-            - @keyframes for the spinner.
-            - Overrides for MapLibre's built-in control styling (the dark
-              glass look matches our panel).
-            - Mobile media query that:
-                * shrinks/moves the MapLibre control cluster
-                * forces inputs to 16px (prevents iOS Safari zoom on focus)
-                * animates the .mobile-collapsible section open/closed
-                * hides the zoom-in/-out buttons on mobile (pinch gesture
-                  is the expected interaction)
-          =================================================================== */}
-      <style>{`
-        @keyframes spin { to { transform: rotate(360deg); } }
-        .maplibregl-ctrl-bottom-right { margin-right: 1rem !important; margin-bottom: 1rem !important; }
-        .maplibregl-ctrl-group {
-          background: rgba(18,18,20,0.85) !important;
-          backdrop-filter: blur(16px) saturate(140%);
-          -webkit-backdrop-filter: blur(16px) saturate(140%);
-          border: 1px solid rgba(255,255,255,0.1) !important;
-          border-radius: 8px !important;
-          box-shadow: 0 4px 12px rgba(0,0,0,0.3) !important;
-          overflow: hidden;
-        }
-        .maplibregl-ctrl-group button {
-          background: transparent !important;
-          width: 36px !important;
-          height: 36px !important;
-        }
-        .maplibregl-ctrl-group button + button {
-          border-top: 1px solid rgba(255,255,255,0.08) !important;
-        }
-        .maplibregl-ctrl-group button:hover {
-          background: rgba(255,255,255,0.08) !important;
-        }
-        .maplibregl-ctrl-group button .maplibregl-ctrl-icon {
-          /* invert the default dark icons so they read on dark glass */
-          filter: invert(1) brightness(1.2) opacity(0.85);
-        }
-        .maplibregl-ctrl-recenter {
-          color: rgba(255,255,255,0.85);
-          display: flex !important;
-          align-items: center;
-          justify-content: center;
-        }
-        .maplibregl-ctrl-recenter:hover {
-          color: #a5b4fc;
-        }
-        /* OSM/MapLibre attribution is hidden visually; OSM credit lives in
-           the README. Be aware of OSM's attribution requirement before
-           deploying. */
-        .maplibregl-ctrl-attrib { display: none !important; }
-        @media (max-width: 640px) {
-          .maplibregl-ctrl-bottom-right {
-            margin-right: 0.5rem !important;
-            /* safe-area-inset accounts for iPhone home indicator. */
-            margin-bottom: calc(0.5rem + env(safe-area-inset-bottom, 0px)) !important;
-          }
-          .maplibregl-ctrl-group button { width: 42px !important; height: 42px !important; }
-          /* 16px+ prevents iOS Safari from auto-zooming on input focus. */
-          input { font-size: 16px !important; }
-          .searchbox-wrap { padding: 0.45rem 0.6rem !important; }
-          /* Spring-eased collapse for the mobile control section. */
-          .mobile-collapsible {
-            overflow: hidden;
-            transition:
-              max-height 0.34s cubic-bezier(0.32, 0.72, 0, 1),
-              opacity 0.22s cubic-bezier(0.32, 0.72, 0, 1),
-              transform 0.34s cubic-bezier(0.32, 0.72, 0, 1),
-              margin-top 0.34s cubic-bezier(0.32, 0.72, 0, 1);
-            transform-origin: top center;
-            will-change: max-height, opacity, transform;
-          }
-          .mobile-collapsible[data-expanded="false"] {
-            max-height: 0 !important;
-            opacity: 0;
-            transform: translateY(-6px) scaleY(0.98);
-            pointer-events: none;
-            gap: 0 !important;
-            margin-top: -0.4rem;
-          }
-          .mobile-collapsible[data-expanded="true"] {
-            max-height: 360px;
-            opacity: 1;
-            transform: translateY(0) scaleY(1);
-          }
-          /* Respect users who've asked for reduced motion. */
-          @media (prefers-reduced-motion: reduce) {
-            .mobile-collapsible { transition: none; }
-          }
-          /* Hide the +/- zoom buttons on mobile — pinch-to-zoom covers it. */
-          .maplibregl-ctrl-group:has(.maplibregl-ctrl-zoom-in) {
-            display: none !important;
-          }
-        }
-      `}</style>
+      {/* NOTE: spinner keyframes, MapLibre control overrides, and the mobile
+          media query that drives `.mobile-collapsible` all live in
+          src/index.css now. */}
     </div>
   );
 }
