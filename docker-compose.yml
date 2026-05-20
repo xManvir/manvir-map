@@ -1,65 +1,111 @@
+# =============================================================================
+# docker-compose.yml — defines the four containers that make up the stack:
+#
+#   valhalla-build : one-shot job; turns an OSM .pbf into Valhalla routing
+#                    tiles. Exits when done. Run with `docker compose up
+#                    valhalla-build`.
+#   valhalla       : long-running routing engine that serves /route over HTTP.
+#   frontend       : nginx serving the built React app and reverse-proxying
+#                    /api → valhalla and /photon → photon.
+#   photon         : long-running geocoder/autocomplete service.
+#
+# All containers share the default Docker bridge network so they can resolve
+# each other by service name (e.g. nginx → "valhalla:8002").
+# =============================================================================
+
 services:
+  # ---------------------------------------------------------------------------
+  # valhalla-build — one-time tile build. Skips its own work if tiles already
+  # exist on disk, so it's safe to leave declared even after the initial run.
+  # ---------------------------------------------------------------------------
   valhalla-build:
     image: ghcr.io/valhalla/valhalla:latest
     container_name: valhalla-build
     volumes:
-      - ./tiles:/tiles
-      - ./custom_files:/custom_files
-      - .:/data
+      - ./tiles:/tiles                # output: tile pyramid + sqlite indexes
+      - ./custom_files:/custom_files  # output: valhalla.json runtime config
+      - .:/data                       # input:  ontario-latest.osm.pbf at repo root
     command:
       - bash
       - -c
       - |
+        # `set -euo pipefail` makes the script fail fast on any error or
+        # unset variable — important for a one-shot build that produces
+        # downstream artifacts. Without this, a silent build failure could
+        # leave the valhalla service stuck on a half-built tileset.
         set -euo pipefail
+        # Idempotency guard: if tiles already exist, skip the expensive
+        # rebuild. Lets you `docker compose up` repeatedly without re-doing
+        # the 30–60 minute tile build.
         if [ -d /tiles/2 ] && [ -f /tiles/admins.sqlite ] && [ -f /tiles/timezones.sqlite ]; then
           echo "Tiles, admins, and timezones already exist — skipping build."
           exit 0
         fi
+        # Otherwise: wipe any partial outputs and rebuild from scratch.
         rm -rf /tiles/0 /tiles/1 /tiles/2 /tiles/admins.sqlite /tiles/timezones.sqlite
+        # 1. Emit a Valhalla config pointing at our tile/timezone/admin paths.
         valhalla_build_config \
           --mjolnir-tile-dir /tiles \
           --mjolnir-timezone /tiles/timezones.sqlite \
           --mjolnir-admin /tiles/admins.sqlite \
           > /custom_files/valhalla.json
+        # 2. Build the timezone database (used for departure/arrival time math).
         valhalla_build_timezones > /tiles/timezones.sqlite
+        # 3. Build the admin polygons (countries/states) so border crossings
+        #    work correctly.
         valhalla_build_admins -c /custom_files/valhalla.json /data/ontario-latest.osm.pbf
+        # 4. The main event — turn OSM into Valhalla's hierarchical tile graph.
         valhalla_build_tiles -c /custom_files/valhalla.json /data/ontario-latest.osm.pbf
         echo "Build complete."
-    restart: "no"
+    restart: "no"     # one-shot job; don't restart after it exits
 
+  # ---------------------------------------------------------------------------
+  # valhalla — the live routing service. Reads the tiles built above.
+  # ---------------------------------------------------------------------------
   valhalla:
     image: ghcr.io/valhalla/valhalla:latest
     container_name: valhalla
     ports:
-      - "8002:8002"
+      - "8002:8002"   # host:container — direct access from the host if needed
     volumes:
       - ./tiles:/tiles
       - ./custom_files:/custom_files
+    # `1` is the worker thread count. Bump on bigger hardware if you expect
+    # parallel requests.
     command: valhalla_service /custom_files/valhalla.json 1
     restart: unless-stopped
 
+  # ---------------------------------------------------------------------------
+  # frontend — nginx serving the Vite-built React bundle plus reverse-proxy
+  # rules for /api and /photon. Image is built locally from frontend/Dockerfile.
+  # ---------------------------------------------------------------------------
   frontend:
     build:
       context: ./frontend
       dockerfile: Dockerfile
     container_name: frontend
     ports:
-      - "8082:80"
+      - "8082:80"     # navigate to http://localhost:8082 in dev
     depends_on:
-      - valhalla
+      - valhalla      # ensure valhalla starts first; doesn't wait for readiness
     restart: unless-stopped
 
+  # ---------------------------------------------------------------------------
+  # photon — Komoot's geocoder. We use a community Docker image that
+  # downloads the regional extract on first boot.
+  # ---------------------------------------------------------------------------
   photon:
     image: rtuszik/photon-docker:latest
     container_name: photon
     volumes:
-      - photon_data:/photon/data
+      - photon_data:/photon/data      # named volume persists ES index
     environment:
-      - REGION=ca
-      - UPDATE_STRATEGY=DISABLED
+      - REGION=ca                     # download the Canada extract
+      - UPDATE_STRATEGY=DISABLED      # don't auto-update at runtime
     ports:
       - "2322:2322"
     restart: unless-stopped
 
+# Named volume for Photon's Elasticsearch data — survives container recreates.
 volumes:
   photon_data:

@@ -1,13 +1,46 @@
+// =============================================================================
+// App.jsx — the entire Manvir Map application in one file.
+//
+// What this file does, at a glance:
+//   1. Renders a full-screen MapLibre map.
+//   2. Lets the user search for an origin and destination using Photon (a
+//      self-hosted geocoder reachable at `/photon/...`).
+//   3. Asks Valhalla (a self-hosted routing engine reachable at `/api/route`)
+//      for a driving route between those two points.
+//   4. Optionally finds "scenic" detour waypoints by querying the public
+//      Overpass API for nearby parks, viewpoints, etc., and feeds those
+//      waypoints back into Valhalla as `through` locations to bend the route.
+//   5. Draws the resulting route line plus markers on the map and shows
+//      distance + duration in a glassmorphic control panel.
+//
+// The file is intentionally a single component tree so a beginner can read it
+// top to bottom. The order is: constants → pure helpers → SearchBox component
+// → main App component → JSX → embedded <style> block.
+// =============================================================================
+
 import { useEffect, useRef, useState } from "react";
 import maplibregl from "maplibre-gl";
 import "maplibre-gl/dist/maplibre-gl.css";
 
+// -----------------------------------------------------------------------------
+// DETOUR_LEVELS — how aggressively to look for scenic stops when the user
+// picks Scenic mode.
+//   corridorKm    : how far (km) off the straight line between origin and
+//                   destination we'll consider a candidate scenic feature.
+//   maxWaypoints  : how many scenic stops to insert into the route at most.
+//   label         : text shown on the Light / Medium / Heavy toggle buttons.
+// -----------------------------------------------------------------------------
 const DETOUR_LEVELS = {
   light: { corridorKm: 4, maxWaypoints: 1, label: "Light" },
   medium: { corridorKm: 10, maxWaypoints: 2, label: "Medium" },
   heavy: { corridorKm: 22, maxWaypoints: 5, label: "Heavy" },
 };
 
+// -----------------------------------------------------------------------------
+// SCENIC_FEATURE_WEIGHTS — scoring weights for different kinds of scenic
+// features returned by Overpass. Higher = more desirable as a detour. A
+// dedicated viewpoint beats a generic city park.
+// -----------------------------------------------------------------------------
 const SCENIC_FEATURE_WEIGHTS = {
   viewpoint: 4,
   scenic: 3.5,
@@ -16,6 +49,11 @@ const SCENIC_FEATURE_WEIGHTS = {
   park: 1.2,
 };
 
+// -----------------------------------------------------------------------------
+// formatDuration — convert a number of seconds into an array of { value, unit }
+// chunks for rendering, e.g. 7320s → [{2,"h"},{2,"min"}]. Skips minutes once
+// the trip is longer than a day, so we never show "3d 4h 17min".
+// -----------------------------------------------------------------------------
 function formatDuration(sec) {
   const totalMin = Math.max(1, Math.round(sec / 60));
   const days = Math.floor(totalMin / (60 * 24));
@@ -28,34 +66,65 @@ function formatDuration(sec) {
   return parts;
 }
 
+// -----------------------------------------------------------------------------
+// toLocalMeters — convert a (lat,lng) pair into a flat (x,y) in metres,
+// centered on a reference point. This is an "equirectangular" projection that
+// is fine for short distances (tens of km) because the curvature of the earth
+// is negligible at that scale. We use it so segment-distance math becomes
+// simple Euclidean geometry instead of great-circle calculations.
+// -----------------------------------------------------------------------------
 function toLocalMeters(lat, lng, refLat, refLng) {
-  const R = 6371000;
+  const R = 6371000; // mean radius of Earth in metres
   const x = (R * Math.cos((refLat * Math.PI) / 180) * (lng - refLng) * Math.PI) / 180;
   const y = (R * (lat - refLat) * Math.PI) / 180;
   return [x, y];
 }
 
+// -----------------------------------------------------------------------------
+// projectOntoSegment — given a point `p` and a line segment from `a` to `b`
+// (all in local meters), return:
+//   dist : perpendicular distance from p to the line containing a→b
+//   t    : how far along the segment the projection lands (0=at a, 1=at b,
+//          values outside [0,1] mean the projection falls beyond the endpoints)
+//
+// We use `t` to filter out scenic candidates that would force the driver to
+// double back behind the origin or overshoot the destination, and `dist` to
+// require candidates to lie within the corridor width.
+// -----------------------------------------------------------------------------
 function projectOntoSegment(p, a, b) {
   const dx = b[0] - a[0], dy = b[1] - a[1];
   const lenSq = dx * dx + dy * dy;
   if (lenSq === 0) return { dist: Math.hypot(p[0] - a[0], p[1] - a[1]), t: 0 };
   const t = ((p[0] - a[0]) * dx + (p[1] - a[1]) * dy) / lenSq;
+  // tc is t clamped to [0,1] so the foot of the perpendicular is on the
+  // segment itself when computing the actual distance.
   const tc = Math.max(0, Math.min(1, t));
   const px = a[0] + tc * dx, py = a[1] + tc * dy;
   return { dist: Math.hypot(p[0] - px, p[1] - py), t };
 }
 
+// -----------------------------------------------------------------------------
+// decodePolyline — Valhalla returns each route leg's shape as a "polyline6"
+// encoded string (Google's polyline format with 6 decimal places of precision
+// instead of the usual 5). This decoder walks the string and rebuilds an
+// array of [lng, lat] pairs that MapLibre can render as a LineString.
+//
+// The format packs each lat/lng delta as a variable-length base-64 integer,
+// using 5 bits per character and the high bit as a "more chunks coming" flag.
+// -----------------------------------------------------------------------------
 function decodePolyline(encoded) {
   let index = 0, lat = 0, lng = 0;
   const coords = [];
   while (index < encoded.length) {
     let b, shift = 0, result = 0;
+    // Decode latitude delta.
     do {
       b = encoded.charCodeAt(index++) - 63;
       result |= (b & 0x1f) << shift;
       shift += 5;
     } while (b >= 0x20);
     lat += result & 1 ? ~(result >> 1) : result >> 1;
+    // Decode longitude delta.
     shift = 0;
     result = 0;
     do {
@@ -64,18 +133,50 @@ function decodePolyline(encoded) {
       shift += 5;
     } while (b >= 0x20);
     lng += result & 1 ? ~(result >> 1) : result >> 1;
+    // MapLibre wants [lng, lat]; precision is 1e-6 because Valhalla uses
+    // polyline6.
     coords.push([lng / 1e6, lat / 1e6]);
   }
   return coords;
 }
 
+// -----------------------------------------------------------------------------
+// scenicCache — in-memory LRU-ish cache for findScenicWaypoints. Overpass
+// queries are slow (1–20s) and the user often retries the same origin/dest
+// with different routing toggles, so caching the heavy network call lets the
+// route refresh feel snappy.
+//
+// The Map preserves insertion order; we drop the oldest key once we hit
+// SCENIC_CACHE_MAX. Cache survives only for the current page load.
+// -----------------------------------------------------------------------------
 const scenicCache = new Map();
 const SCENIC_CACHE_MAX = 32;
 
+// -----------------------------------------------------------------------------
+// findScenicWaypoints — query Overpass for candidate scenic features in a
+// rectangle around the straight-line corridor between origin and dest, score
+// them, and pick the best ones to use as routing waypoints.
+//
+// Returns: array of { lat, lng, type, name } in route order (smallest t to
+//          largest t along the origin→dest segment).
+//
+// Why this is non-trivial:
+//   - Overpass is a shared public service so we keep the query tight.
+//   - We have to project candidates onto the origin→dest segment to make sure
+//     they actually lie *between* the endpoints, not behind or beyond them.
+//   - We enforce a minimum spacing along the segment so we don't pick 5 parks
+//     all clustered in the same town.
+// -----------------------------------------------------------------------------
 async function findScenicWaypoints(origin, dest, level) {
+  // Cache key includes the level (corridor width) and rounded coords so trips
+  // that start "basically here" reuse the same result.
   const cacheKey = `${level}:${origin.lat.toFixed(3)},${origin.lng.toFixed(3)}->${dest.lat.toFixed(3)},${dest.lng.toFixed(3)}`;
   if (scenicCache.has(cacheKey)) return scenicCache.get(cacheKey);
+
   const { corridorKm, maxWaypoints } = DETOUR_LEVELS[level];
+  // 1° of latitude is ~111 km. Padding the bbox by corridorKm/111 degrees in
+  // each direction approximates the corridor width without doing real
+  // projection math. Good enough at Ontario latitudes.
   const pad = corridorKm / 111;
   const south = Math.min(origin.lat, dest.lat) - pad;
   const north = Math.max(origin.lat, dest.lat) + pad;
@@ -83,6 +184,10 @@ async function findScenicWaypoints(origin, dest, level) {
   const east = Math.max(origin.lng, dest.lng) + pad;
   const bbox = `${south},${west},${north},${east}`;
 
+  // Overpass QL query — fetch tourism viewpoints, scenic-tagged ways, parks,
+  // and national parks inside the bbox. `out center 300` asks for at most 300
+  // results with a single centerpoint per way/relation (we don't need full
+  // geometry, just a representative coordinate).
   const query = `
 [out:json][timeout:20];
 (
@@ -107,22 +212,31 @@ out center 300;
     const json = await res.json();
     elements = json.elements || [];
   } catch {
+    // Network or server error — silently fall back to "no detours" so the
+    // main route still gets calculated.
     return [];
   }
 
+  // Set up a local-meter coordinate system centered on the midpoint of the
+  // trip so segment math stays accurate for trips up to a few hundred km.
   const refLat = (origin.lat + dest.lat) / 2;
   const refLng = (origin.lng + dest.lng) / 2;
   const a = toLocalMeters(origin.lat, origin.lng, refLat, refLng);
   const b = toLocalMeters(dest.lat, dest.lng, refLat, refLng);
   const corridorM = corridorKm * 1000;
+  // Reject candidates too close to the endpoints. Heavy mode is more
+  // permissive because the user explicitly asked for big detours.
   const minT = level === "heavy" ? 0.1 : 0.15;
   const maxT = level === "heavy" ? 0.9 : 0.85;
 
   const candidates = [];
   for (const el of elements) {
+    // Overpass nodes carry lat/lon directly; ways/relations carry .center.
     const lat = el.lat ?? el.center?.lat;
     const lng = el.lon ?? el.center?.lon;
     if (lat == null || lng == null) continue;
+
+    // Classify the element into one of our weighted types.
     const tags = el.tags || {};
     let type;
     if (tags.tourism === "viewpoint") type = "viewpoint";
@@ -132,18 +246,24 @@ out center 300;
     else if (tags.leisure === "park") type = "park";
     else continue;
 
+    // Project onto the origin→dest segment and filter by position + offset.
     const p = toLocalMeters(lat, lng, refLat, refLng);
     const { dist, t } = projectOntoSegment(p, a, b);
     if (t < minT || t > maxT) continue;
     if (dist > corridorM) continue;
 
+    // Score = type weight, penalized by how far off the line we'd have to
+    // drive (1500m softens the falloff).
     const weight = SCENIC_FEATURE_WEIGHTS[type];
     const score = weight / (1 + dist / 1500);
     candidates.push({ lat, lng, type, dist, t, score, name: tags.name });
   }
 
+  // Best-scoring candidates first.
   candidates.sort((x, y) => y.score - x.score);
 
+  // Greedy pick with spacing constraint so the waypoints aren't piled on top
+  // of each other along the route.
   const picked = [];
   const minSpacing = level === "heavy" ? 0.13 : 0.25;
   for (const c of candidates) {
@@ -151,7 +271,10 @@ out center 300;
     if (picked.some((p) => Math.abs(p.t - c.t) < minSpacing)) continue;
     picked.push(c);
   }
+  // Hand them back to Valhalla in route order (origin → ... → dest).
   picked.sort((x, y) => x.t - y.t);
+
+  // Trim cache to avoid unbounded growth across a long session.
   if (scenicCache.size >= SCENIC_CACHE_MAX) {
     scenicCache.delete(scenicCache.keys().next().value);
   }
@@ -159,6 +282,10 @@ out center 300;
   return picked;
 }
 
+// -----------------------------------------------------------------------------
+// MODES — the three routing presets shown as a segmented control at the top
+// of the panel. `id` matches keys in baseCosting{} inside fetchRoute().
+// -----------------------------------------------------------------------------
 const MODES = [
   {
     id: "normal",
@@ -183,44 +310,78 @@ const MODES = [
   },
 ];
 
+// =============================================================================
+// SearchBox — autocomplete input bound to the Photon geocoder.
+//
+// Props:
+//   label, icon         : placeholder + (unused) icon for the input
+//   value, onChange     : controlled-input glue
+//   onSelect            : called with { lng, lat, name } when user picks a row
+//   onClear             : optional; if provided, an "×" button appears
+//   inputRef            : optional ref to the underlying <input>
+//   onFocus             : extra side-effect to run when the input gains focus
+//                         (used to expand the mobile panel)
+//   biasLat, biasLng    : optional location bias for Photon — results closer
+//                         to this point are preferred
+//
+// Network behavior:
+//   - Debounces 200ms before firing a request.
+//   - Aborts the in-flight request when a new keystroke arrives.
+//   - Uses a monotonic request id to ignore late responses that arrive out of
+//     order (in case AbortController didn't quite win the race).
+// =============================================================================
 function SearchBox({ label, icon, value, onChange, onSelect, onClear, inputRef, onFocus: onFocusProp, biasLat, biasLng }) {
+  // Dropdown rows from Photon.
   const [results, setResults] = useState([]);
+  // Whether the input has focus — controls dropdown visibility + border color.
   const [focused, setFocused] = useState(false);
+  // Index of the keyboard-highlighted row (-1 = none).
   const [highlight, setHighlight] = useState(-1);
+  // Ref to the AbortController for the currently in-flight Photon request.
   const abortRef = useRef(null);
+  // Ref to the pending debounce timeout.
   const debounceRef = useRef(null);
+  // Monotonic counter so older fetches can be discarded if they resolve late.
   const reqIdRef = useRef(0);
 
+  // Cleanup on unmount: cancel any pending debounce + in-flight fetch.
   useEffect(() => () => {
     if (debounceRef.current) clearTimeout(debounceRef.current);
     abortRef.current?.abort();
   }, []);
 
+  // Fire the actual Photon search for the given query value.
   function runSearch(val) {
     abortRef.current?.abort();
     const ctrl = new AbortController();
     abortRef.current = ctrl;
     const myId = ++reqIdRef.current;
+    // Photon supports `lat`/`lon` for biasing search results toward a point.
     const bias = biasLat != null && biasLng != null
       ? `&lat=${biasLat}&lon=${biasLng}`
       : "";
     fetch(`/photon/api?q=${encodeURIComponent(val)}&limit=5${bias}`, { signal: ctrl.signal })
       .then((r) => r.json())
       .then((data) => {
+        // Drop the response if a newer request started after this one.
         if (myId !== reqIdRef.current) return;
         setResults(Array.isArray(data.features) ? data.features : []);
         setHighlight(-1);
       })
       .catch((e) => {
+        // Ignore aborts (those are intentional); reset on real errors.
         if (e.name !== "AbortError") setResults([]);
       });
   }
 
+  // Input onChange handler. Debounces and short-circuits on tiny queries.
   function handleChange(e) {
     const val = e.target.value;
     onChange(val);
     if (debounceRef.current) clearTimeout(debounceRef.current);
     if (val.length < 3) {
+      // Don't pester Photon with single- or two-letter queries — they return
+      // too much noise anyway.
       abortRef.current?.abort();
       setResults([]);
       setHighlight(-1);
@@ -229,12 +390,14 @@ function SearchBox({ label, icon, value, onChange, onSelect, onClear, inputRef, 
     debounceRef.current = setTimeout(() => runSearch(val), 200);
   }
 
+  // Format a Photon feature's properties into a single human-readable line.
   function formatName(props) {
     return [props.name, props.street, props.city, props.state]
       .filter(Boolean)
       .join(", ");
   }
 
+  // Commit the chosen result back up to the parent.
   function handleSelect(feature) {
     const [lng, lat] = feature.geometry.coordinates;
     const name = formatName(feature.properties);
@@ -243,6 +406,7 @@ function SearchBox({ label, icon, value, onChange, onSelect, onClear, inputRef, 
     onSelect({ lng, lat, name });
   }
 
+  // Keyboard navigation in the dropdown: arrows, Enter, Escape.
   function handleKeyDown(e) {
     if (!results.length) return;
     if (e.key === "ArrowDown") {
@@ -252,6 +416,7 @@ function SearchBox({ label, icon, value, onChange, onSelect, onClear, inputRef, 
       e.preventDefault();
       setHighlight((h) => (h <= 0 ? results.length - 1 : h - 1));
     } else if (e.key === "Enter") {
+      // If nothing's highlighted yet, default to the first result.
       const idx = highlight >= 0 ? highlight : 0;
       if (results[idx]) {
         e.preventDefault();
@@ -265,6 +430,7 @@ function SearchBox({ label, icon, value, onChange, onSelect, onClear, inputRef, 
 
   return (
     <div style={{ position: "relative" }}>
+      {/* The pill-shaped input container. Border lights up on focus. */}
       <div
         className="searchbox-wrap"
         style={{
@@ -287,6 +453,8 @@ function SearchBox({ label, icon, value, onChange, onSelect, onClear, inputRef, 
             setFocused(true);
             onFocusProp?.();
           }}
+          // 150ms delay on blur lets a click on a dropdown row register
+          // before we hide the dropdown.
           onBlur={() => setTimeout(() => setFocused(false), 150)}
           placeholder={label}
           aria-label={label}
@@ -303,9 +471,12 @@ function SearchBox({ label, icon, value, onChange, onSelect, onClear, inputRef, 
             minWidth: 0,
           }}
         />
+        {/* Clear button — shown only if onClear was passed AND there's text. */}
         {onClear && value && (
           <button
             type="button"
+            // preventDefault on mousedown stops the input from losing focus
+            // before the click handler runs.
             onMouseDown={(e) => e.preventDefault()}
             onClick={() => {
               setResults([]);
@@ -334,6 +505,8 @@ function SearchBox({ label, icon, value, onChange, onSelect, onClear, inputRef, 
           </button>
         )}
       </div>
+      {/* Dropdown of geocoder results, only when input is focused and has
+          results to show. */}
       {focused && results.length > 0 && (
         <ul
           style={{
@@ -358,6 +531,8 @@ function SearchBox({ label, icon, value, onChange, onSelect, onClear, inputRef, 
               : "";
             return (
               <li
+                // osm_id is unique-per-feature when available; index is a
+                // fallback so React still gets a stable key.
                 key={f.properties?.osm_id ?? i}
                 title={coordStr}
                 onMouseDown={(e) => e.preventDefault()}
@@ -387,43 +562,80 @@ function SearchBox({ label, icon, value, onChange, onSelect, onClear, inputRef, 
   );
 }
 
+// =============================================================================
+// App — the root component. Owns:
+//   - the MapLibre map instance (created exactly once)
+//   - origin/destination state and their search-box text
+//   - the current routing mode + preference toggles
+//   - the active route's geometry, distance, and duration
+//   - all of the marker DOM nodes (held in refs because MapLibre owns them
+//     imperatively, not via React).
+// =============================================================================
 function App() {
-  const mapContainer = useRef(null);
-  const map = useRef(null);
-  const markers = useRef([]);
-  const [origin, setOrigin] = useState(null);
+  // -------------------- map + DOM refs --------------------
+  const mapContainer = useRef(null); // <div> the map paints into
+  const map = useRef(null);          // the MapLibre Map instance
+  const markers = useRef([]);        // origin + destination marker objects
+
+  // -------------------- routing state --------------------
+  const [origin, setOrigin] = useState(null);          // { lng, lat, name, isCurrent? }
   const [destination, setDestination] = useState(null);
-  const [originQuery, setOriginQuery] = useState("");
-  const [destQuery, setDestQuery] = useState("");
-  const [routeInfo, setRouteInfo] = useState(null);
-  const [routeMode, setRouteMode] = useState("normal");
+  const [originQuery, setOriginQuery] = useState("");  // text in origin SearchBox
+  const [destQuery, setDestQuery] = useState("");      // text in dest SearchBox
+  const [routeInfo, setRouteInfo] = useState(null);    // { distance, durationSec, waypointCount }
+  const [routeMode, setRouteMode] = useState("normal");// "normal" | "newDriver" | "scenic"
   const [loading, setLoading] = useState(false);
   const [loadingMsg, setLoadingMsg] = useState("Calculating route…");
   const [routeError, setRouteError] = useState(null);
+
+  // -------------------- UI toggles --------------------
+  // Whether the origin input row is exposed (false = origin is locked to
+  // "Your location" with a Change button).
   const [showOrigin, setShowOrigin] = useState(false);
+  // Light/Medium/Heavy detour intensity, only meaningful in scenic mode.
   const [detourLevel, setDetourLevel] = useState("medium");
+  // Booleans for whether each road type is allowed.
   const [prefs, setPrefs] = useState({
     highways: true,
     tolls: true,
     ferries: true,
   });
+  // Whether the collapsible controls section is expanded on mobile.
   const [mobileExpanded, setMobileExpanded] = useState(false);
+  // Friendly error message when geolocation fails.
   const [geoError, setGeoError] = useState(null);
+
+  // Markers for scenic stops (separate ref so they can be cleared without
+  // touching the origin/dest markers).
   const scenicMarkers = useRef([]);
+  // Cached LngLatBounds for the active route, used by the recenter button.
   const routeBounds = useRef(null);
+  // What the recenter button should fly to next: "user" or "route".
+  // Toggles each time the button is pressed.
   const recenterTarget = useRef("user");
+
+  // Mobile vs desktop layout flag, driven by viewport width.
   const [isMobile, setIsMobile] = useState(
     typeof window !== "undefined" && window.innerWidth <= 640,
   );
 
+  // Listen for window resize so the layout responds to rotation / window
+  // dragging across the 640px breakpoint.
   useEffect(() => {
     const onResize = () => setIsMobile(window.innerWidth <= 640);
     window.addEventListener("resize", onResize);
     return () => window.removeEventListener("resize", onResize);
   }, []);
 
+  // The user's current geolocation, in a ref because it doesn't need to
+  // trigger re-renders on its own.
   const userLocation = useRef(null);
 
+  // ---------------------------------------------------------------------------
+  // reverseGeocode — ask Photon for a human-readable name for a coordinate.
+  // Used after geolocation to label the "Your location" pill, and when the
+  // user toggles back to "Use my current location".
+  // ---------------------------------------------------------------------------
   async function reverseGeocode(lat, lng) {
     try {
       const res = await fetch(`/photon/api/reverse?lat=${lat}&lon=${lng}`);
@@ -434,24 +646,39 @@ function App() {
         "Current location"
       );
     } catch {
+      // If Photon is unreachable, fall back to a generic label.
       return "Current location";
     }
   }
 
+  // ---------------------------------------------------------------------------
+  // Mount effect — build the map exactly once. The empty dep array + the
+  // `if (map.current) return` guard make this safe under React StrictMode's
+  // double-invoke in development.
+  // ---------------------------------------------------------------------------
   useEffect(() => {
     if (map.current) return;
 
+    // Create the MapLibre map. Centered on Toronto until geolocation lands.
     map.current = new maplibregl.Map({
       container: mapContainer.current,
-      style: "https://tiles.openfreemap.org/styles/liberty",
+      style: "https://tiles.openfreemap.org/styles/liberty", // free vector tiles
       center: [-79.383184, 43.653226],
       zoom: 9,
-      pitchWithRotate: false,
+      pitchWithRotate: false, // we don't want pitch shifting on rotate gesture
     });
 
+    // Slow the trackpad/wheel zoom way down so a small wheel motion doesn't
+    // fling the user from a street view to a continent view.
     map.current.scrollZoom.setZoomRate(1 / 50);
     map.current.scrollZoom.setWheelZoomRate(1 / 200);
 
+    // -------------------------------------------------------------------------
+    // Custom MapLibre control: "recenter" button.
+    //   First press  → frame the active route (if any) or fly to the user.
+    //   Next press   → toggle to the other target.
+    // MapLibre's IControl interface requires onAdd/onRemove that return DOM.
+    // -------------------------------------------------------------------------
     const recenter = {
       onAdd: () => {
         const container = document.createElement("div");
@@ -460,6 +687,7 @@ function App() {
         btn.type = "button";
         btn.title = "Recenter on your location";
         btn.className = "maplibregl-ctrl-recenter";
+        // Inline SVG so we don't need an icon font/library.
         btn.innerHTML = `
           <svg width="18" height="18" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
             <circle cx="12" cy="12" r="3.5" fill="currentColor"/>
@@ -470,6 +698,8 @@ function App() {
             <line x1="19.5" y1="12" x2="22.5" y2="12" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
           </svg>
         `;
+        // Helper: fly the camera to the user's geolocation, requesting it
+        // fresh if we haven't yet captured it.
         const flyToUser = () => {
           if (userLocation.current) {
             const { lng, lat } = userLocation.current;
@@ -487,11 +717,13 @@ function App() {
           }
         };
         btn.onclick = () => {
+          // If a route is on screen and we last centered on the user, the
+          // next press frames the whole route. Otherwise, fly to the user.
           if (routeBounds.current && recenterTarget.current === "user") {
             map.current?.fitBounds(routeBounds.current, {
               padding: window.innerWidth <= 640
                 ? { top: 120, bottom: 80, left: 40, right: 40 }
-                : { top: 80, bottom: 80, left: 340, right: 80 },
+                : { top: 80, bottom: 80, left: 340, right: 80 }, // leave room for the side panel
               duration: 600,
             });
             recenterTarget.current = "route";
@@ -507,6 +739,7 @@ function App() {
     };
 
     map.current.addControl(recenter, "bottom-right");
+    // Built-in zoom in/out buttons (compass + pitch hidden — pitch is off).
     map.current.addControl(
       new maplibregl.NavigationControl({
         showCompass: false,
@@ -515,22 +748,30 @@ function App() {
       "bottom-right",
     );
 
+    // When the user starts panning/dragging the map, collapse the mobile
+    // panel so it doesn't obscure the map. `e.originalEvent` is only present
+    // for user-initiated movements (not programmatic flyTo/fitBounds).
     map.current.on("movestart", (e) => {
       if (e.originalEvent) setMobileExpanded(false);
     });
 
+    // Tap-to-collapse on mobile: same idea, but for taps that don't pan.
     map.current.on("click", () => {
       if (window.innerWidth <= 640) setMobileExpanded(false);
     });
 
+    // Try to grab the user's geolocation. On success, place a blue "you are
+    // here" dot and set the origin to current location.
     if (navigator.geolocation) {
       navigator.geolocation.getCurrentPosition(
         async (pos) => {
           const { latitude: lat, longitude: lng } = pos.coords;
           userLocation.current = { lng, lat };
           setGeoError(null);
+          // jumpTo skips the flyTo animation since this is the initial load.
           map.current.jumpTo({ center: [lng, lat], zoom: 15 });
 
+          // Build the blue-dot marker with a glow ring.
           const el = document.createElement("div");
           el.style.cssText = `
             width: 16px; height: 16px; border-radius: 50%;
@@ -542,11 +783,16 @@ function App() {
             .setLngLat([lng, lat])
             .addTo(map.current);
 
+          // Reverse-geocode for a friendly origin label.
           const name = await reverseGeocode(lat, lng);
+          // `isCurrent` flag lets later code know this origin came from
+          // geolocation (so we suppress its pin and clear it if the user
+          // starts typing a new origin).
           setOrigin({ lng, lat, name, isCurrent: true });
           setOriginQuery(name);
         },
         (err) => {
+          // Translate browser geolocation error codes into friendly text.
           if (err.code === err.PERMISSION_DENIED) {
             setGeoError("Location access denied — set a starting point manually.");
           } else if (err.code === err.TIMEOUT) {
@@ -554,31 +800,46 @@ function App() {
           } else {
             setGeoError("Location unavailable — set a starting point manually.");
           }
+          // Reveal the manual origin input so the user has a path forward.
           setShowOrigin(true);
         },
         { enableHighAccuracy: true, timeout: 8000 },
       );
     } else {
+      // Browser doesn't even support geolocation API.
       setGeoError("Geolocation not supported — set a starting point manually.");
       setShowOrigin(true);
     }
   }, []);
 
+  // ---------------------------------------------------------------------------
+  // Marker effect — re-draws origin + destination teardrop markers whenever
+  // either endpoint changes. We tear all markers down and rebuild because
+  // MapLibre markers carry their own DOM and it's simpler than diffing.
+  //
+  // We skip drawing the origin marker when origin.isCurrent is true — the
+  // blue "you are here" dot covers that visually.
+  // ---------------------------------------------------------------------------
   useEffect(() => {
     if (!map.current) return;
     markers.current.forEach((m) => m.remove());
     markers.current = [];
 
+    // Build the list of points to render. The map((p,i) => …) keeps the
+    // index so we can check "is this the origin pin?" without an extra prop.
     const pts = [origin, destination]
       .map((p, i) => (p && !(i === 0 && p.isCurrent) ? p : null))
       .filter(Boolean);
     pts.forEach((p) => {
       const isOrigin = p === origin;
+      // Two different teardrop color palettes: dark grey for origin, red
+      // gradient for destination.
       const gradId = isOrigin ? "gradA" : "gradB";
       const top = isOrigin ? "#374151" : "#ef4444";
       const bot = isOrigin ? "#111827" : "#991b1b";
       const el = document.createElement("div");
       el.style.cssText = "width: 28px; height: 38px; cursor: pointer;";
+      // SVG teardrop with a gradient fill and a soft drop shadow.
       el.innerHTML = `
         <svg width="28" height="38" viewBox="0 0 28 38" xmlns="http://www.w3.org/2000/svg">
           <defs>
@@ -596,6 +857,8 @@ function App() {
           <circle cx="14" cy="14" r="4.5" fill="white" opacity="0.95"/>
         </svg>
       `;
+      // anchor: "bottom" makes the pointy tip of the teardrop sit on the
+      // actual coordinate, which is what users expect.
       const marker = new maplibregl.Marker({ element: el, anchor: "bottom" })
         .setLngLat([p.lng, p.lat])
         .addTo(map.current);
@@ -603,12 +866,21 @@ function App() {
     });
   }, [origin, destination]);
 
+  // ---------------------------------------------------------------------------
+  // Routing trigger — whenever either endpoint, the mode, the detour level,
+  // or the preference toggles change, refetch the route. If either endpoint
+  // is missing, clear any drawn route instead.
+  // ---------------------------------------------------------------------------
   useEffect(() => {
     if (!map.current) return;
     if (origin && destination) fetchRoute(origin, destination);
     else clearRoute();
   }, [origin, destination, routeMode, detourLevel, prefs]);
 
+  // ---------------------------------------------------------------------------
+  // clearRoute — wipe the route line layer + source + scenic markers, reset
+  // the cached bounds, and clear the displayed distance/duration.
+  // ---------------------------------------------------------------------------
   function clearRoute() {
     if (map.current?.getSource("route")) {
       map.current.removeLayer("route-line");
@@ -621,11 +893,19 @@ function App() {
     setRouteInfo(null);
   }
 
+  // ---------------------------------------------------------------------------
+  // clearScenicMarkers — remove just the scenic-stop green dots. Used when
+  // switching out of scenic mode without clearing the whole route.
+  // ---------------------------------------------------------------------------
   function clearScenicMarkers() {
     scenicMarkers.current.forEach((m) => m.remove());
     scenicMarkers.current = [];
   }
 
+  // ---------------------------------------------------------------------------
+  // drawScenicMarkers — render a small green badge with a type-specific
+  // emoji at each scenic waypoint along the route.
+  // ---------------------------------------------------------------------------
   function drawScenicMarkers(waypoints) {
     clearScenicMarkers();
     const icons = {
@@ -637,6 +917,7 @@ function App() {
     };
     waypoints.forEach((w) => {
       const el = document.createElement("div");
+      // Hover tooltip — either the OSM name plus type, or just the type.
       el.title = w.name ? `${w.name} (${w.type})` : w.type;
       el.style.cssText = `
         width: 22px; height: 22px; border-radius: 50%;
@@ -654,20 +935,38 @@ function App() {
     });
   }
 
+  // ---------------------------------------------------------------------------
+  // fetchRoute — the big one. Talks to Valhalla, optionally with scenic
+  // waypoints, draws the resulting line, fits the camera to it, and updates
+  // the distance/duration display.
+  //
+  // Flow:
+  //   1. Build a Valhalla costing object based on mode + prefs.
+  //   2. If scenic, look up waypoints via Overpass.
+  //   3. POST to /api/route. Retry without waypoints if that fails.
+  //   4. Retry with bigger snap radius if Valhalla complains it can't find
+  //      a road near the click point.
+  //   5. Decode the polyline, render as a line layer, fit bounds.
+  // ---------------------------------------------------------------------------
   async function fetchRoute(o, d) {
+    // Mode-specific Valhalla costing tuning. These keys are documented in
+    // the Valhalla "auto" costing options.
     const baseCosting = {
       normal: {},
       newDriver: { use_highways: 0, use_tolls: 0, turn_penalty_factor: 100 },
       scenic: { use_living_streets: 0.7 },
     };
+    // Layer the user's manual highway/toll/ferry toggles on top. 0 = avoid.
     const overrides = {
       ...(prefs.highways ? {} : { use_highways: 0 }),
       ...(prefs.tolls ? {} : { use_tolls: 0 }),
       ...(prefs.ferries ? {} : { use_ferry: 0 }),
     };
+    // Valhalla expects costing options nested under the costing name.
     const costingOptions = {
       [routeMode]: { auto: { ...baseCosting[routeMode], ...overrides } },
     };
+    // Route polyline color per mode — matches the segmented control accent.
     const routeColors = {
       normal: "#3b82f6",
       newDriver: "#f59e0b",
@@ -677,6 +976,7 @@ function App() {
     setLoading(true);
     setRouteError(null);
     try {
+      // Step 1: find scenic detour waypoints, if applicable.
       let scenicWaypoints = [];
       if (routeMode === "scenic") {
         setLoadingMsg("Finding scenic detour…");
@@ -684,9 +984,16 @@ function App() {
       }
       setLoadingMsg("Calculating route…");
 
+      // Inner helper that builds + POSTs the Valhalla request. `endpointRadius`
+      // tells Valhalla how far it may snap the origin/dest to the nearest
+      // routable road (metres). A bigger radius is the rescue path for
+      // addresses that geocoded to a non-road location.
       async function callValhalla(waypoints, endpointRadius) {
         const locations = [
           { lon: o.lng, lat: o.lat, radius: endpointRadius },
+          // `type: "through"` makes Valhalla pass *through* the waypoint
+          // without treating it as a stop. radius:2000 lets it snap up to
+          // 2 km because parks/viewpoints rarely sit on a road.
           ...waypoints.map((w) => ({
             lon: w.lng,
             lat: w.lat,
@@ -708,34 +1015,50 @@ function App() {
         return { res: r, body: await r.json() };
       }
 
+      // First attempt: include scenic waypoints (if any), tight snap radius.
       let { res, body: data } = await callValhalla(scenicWaypoints, 100);
+
+      // Fallback 1: if Valhalla failed and we had waypoints, retry without
+      // them. Some waypoints just can't be routed through.
       if ((!res.ok || !data.trip?.legs?.[0]) && scenicWaypoints.length > 0) {
         scenicWaypoints = [];
         ({ res, body: data } = await callValhalla([], 100));
       }
+      // Fallback 2: if Valhalla complains about "no suitable edges", retry
+      // with a much bigger snap radius so it can find *any* routable road.
       if (!res.ok && /no suitable edges|no edges? near/i.test(typeof data?.error === "string" ? data.error : "")) {
         ({ res, body: data } = await callValhalla(scenicWaypoints, 1000));
       }
+      // If we still don't have a usable trip, surface a friendly error.
       if (!res.ok || !data.trip?.legs?.[0]) {
         const raw = typeof data?.error === "string" ? data.error : "";
+        // Internal Valhalla errors look like file:line traces — sanitize
+        // those into a generic "try a nearby address" hint.
         const friendly = res.status >= 500 || /graphtile|out of bounds|assert|\.h:\d+/i.test(raw)
           ? "Couldn't route to that location — try a nearby address."
           : raw || "No route found between these points.";
         throw new Error(friendly);
       }
+
+      // Pull distance + duration from the trip summary.
       const { length, time } = data.trip.summary;
       setRouteInfo({
         distance: length.toFixed(1),
         durationSec: time,
         waypointCount: scenicWaypoints.length,
       });
+      // Auto-collapse the mobile panel once we have a result so the user
+      // can see the route immediately.
       setMobileExpanded(false);
 
+      // Decode each leg and concatenate into one continuous coord array.
       const coords = data.trip.legs.flatMap((leg) => decodePolyline(leg.shape));
       const geojson = {
         type: "Feature",
         geometry: { type: "LineString", coordinates: coords },
       };
+      // Update the existing line in place if present, otherwise add new
+      // source + layer. In-place update avoids a brief flicker.
       const existing = map.current.getSource("route");
       if (existing) {
         existing.setData(geojson);
@@ -753,15 +1076,20 @@ function App() {
         });
       }
 
+      // Drop or clear scenic markers depending on the mode.
       if (routeMode === "scenic") drawScenicMarkers(scenicWaypoints);
       else clearScenicMarkers();
 
+      // Compute the bounding box of all route coordinates so we can frame
+      // the whole route on screen.
       const bounds = coords.reduce(
         (b, c) => b.extend(c),
         new maplibregl.LngLatBounds(coords[0], coords[0]),
       );
       routeBounds.current = bounds;
       recenterTarget.current = "route";
+      // Padding differs between mobile (panel is on top) and desktop (panel
+      // is on the left). Numbers tuned so the route never hides behind UI.
       map.current.fitBounds(bounds, {
         padding: isMobile
           ? { top: 240, bottom: 80, left: 40, right: 40 }
@@ -769,6 +1097,7 @@ function App() {
         duration: 600,
       });
     } catch (err) {
+      // Any failure: show the message, drop the route, drop scenic markers.
       setRouteError(err.message || "Couldn't fetch route");
       setRouteInfo(null);
       clearScenicMarkers();
@@ -781,6 +1110,10 @@ function App() {
     }
   }
 
+  // ---------------------------------------------------------------------------
+  // handleSwap — swap origin and destination. The text inputs swap too so
+  // the displayed names follow the swap.
+  // ---------------------------------------------------------------------------
   function handleSwap() {
     setOrigin(destination);
     setDestination(origin);
@@ -788,6 +1121,11 @@ function App() {
     setDestQuery(originQuery);
   }
 
+  // ---------------------------------------------------------------------------
+  // handleReset — clear the destination + any drawn route and fly the camera
+  // back to either the origin, the user's location, or the default Toronto
+  // view, in that priority order.
+  // ---------------------------------------------------------------------------
   function handleReset() {
     setDestination(null);
     setDestQuery("");
@@ -805,8 +1143,26 @@ function App() {
     });
   }
 
+  // Currently-selected mode's metadata, used for accent color + spinner.
   const activeMode = MODES.find((m) => m.id === routeMode);
 
+  // ===========================================================================
+  // JSX render tree.
+  //
+  // Layout overview:
+  //   <div fixed inset:0>
+  //     <div ref=mapContainer>           ← map paints behind everything
+  //     <div absolute top/left panel>    ← controls + search + route info
+  //       <h1>                            (desktop only)
+  //       <div mobile-collapsible>        ← mode toggles, prefs, detour
+  //       <div search row>                ← origin + dest inputs
+  //       <one-of>                        current-location pill or "←"
+  //       {geoError && ...}
+  //       {routeError && ...}
+  //       {(loading || routeInfo) && ...} ← distance/duration summary
+  //       {scenic & no waypoints note}
+  //     <style> embedded CSS (keyframes + maplibre overrides + media queries)
+  // ===========================================================================
   return (
     <div
       style={{
@@ -815,11 +1171,14 @@ function App() {
         fontFamily: "-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif",
       }}
     >
+      {/* The map canvas itself. inset:0 fills the whole viewport. */}
       <div
         ref={mapContainer}
         style={{ position: "absolute", inset: 0 }}
       />
 
+      {/* Floating glass control panel. Slightly different geometry on mobile
+          (full-width, smaller paddings) vs desktop (fixed 300px sidebar). */}
       <div
         style={{
           position: "absolute",
@@ -829,6 +1188,8 @@ function App() {
           width: isMobile ? "auto" : "300px",
           maxHeight: isMobile ? "calc(100dvh - 1rem)" : "calc(100vh - 2rem)",
           background: "rgba(18, 18, 20, 0.72)",
+          // backdrop-filter creates the frosted glass look. Both spellings
+          // are needed for cross-browser support.
           backdropFilter: "blur(28px) saturate(160%)",
           WebkitBackdropFilter: "blur(28px) saturate(160%)",
           border: "1px solid rgba(255,255,255,0.08)",
@@ -842,6 +1203,7 @@ function App() {
           overflow: "visible",
         }}
       >
+        {/* App title — desktop only; mobile hides it to save vertical space. */}
         {!isMobile && (
           <div
             style={{ display: "flex", alignItems: "center", gap: "0.5rem" }}
@@ -860,6 +1222,11 @@ function App() {
           </div>
         )}
 
+        {/* mobile-collapsible: the whole "extra controls" block — mode
+            tabs, prefs toggles, detour intensity. Collapsed by default on
+            mobile, animates open when the user focuses a search input or
+            taps anywhere inside the panel. CSS for the animation is in the
+            <style> block at the bottom of the file. */}
         <div
           className="mobile-collapsible"
           data-expanded={mobileExpanded ? "true" : "false"}
@@ -867,9 +1234,10 @@ function App() {
             display: "flex",
             flexDirection: "column",
             gap: isMobile ? "0.4rem" : "0.65rem",
-            order: isMobile ? 3 : 0,
+            order: isMobile ? 3 : 0, // on mobile, push this below search inputs
           }}
         >
+        {/* MODE SEGMENTED CONTROL — Normal / New Driver / Scenic */}
         <div
           style={{
             display: "flex",
@@ -910,6 +1278,8 @@ function App() {
           })}
         </div>
 
+        {/* PREFERENCE TOGGLES — highways / tolls / ferries.
+            Allowed = subtle white background, disallowed = red strikethrough. */}
         <div style={{ display: "flex", gap: "4px" }}>
           {[
             { id: "highways", icon: "🛣️", label: "Highways" },
@@ -944,15 +1314,20 @@ function App() {
                   textDecorationThickness: "1px",
                 }}
               >
+                {/* Inner span resets textDecoration so the emoji never gets
+                    a strikethrough line drawn through it. */}
                 <span style={{ fontSize: "0.9rem", textDecoration: "none" }}>
                   {opt.icon}
                 </span>
+                {/* Hide the text label on mobile to keep buttons compact. */}
                 {!isMobile && opt.label}
               </button>
             );
           })}
         </div>
 
+        {/* DETOUR INTENSITY — only visible in scenic mode. Disabled during
+            an in-flight route fetch to avoid spamming Overpass. */}
         {routeMode === "scenic" && (
           <div style={{ display: "flex", alignItems: "center", gap: "0.4rem" }}>
             {!isMobile && (
@@ -998,16 +1373,21 @@ function App() {
           </div>
         )}
         </div>
+        {/* /mobile-collapsible */}
 
+        {/* SEARCH INPUTS — origin (conditional) + destination, with the
+            circular swap button overlapping their right edge. */}
         <div
           style={{
             position: "relative",
             display: "flex",
             flexDirection: "column",
             gap: "0.4rem",
-            order: isMobile ? 1 : 0,
+            order: isMobile ? 1 : 0, // first on mobile
           }}
         >
+          {/* Origin SearchBox is only shown when the user explicitly toggles
+              "Change" from the current-location pill below. */}
           {showOrigin && (
             <SearchBox
               label="Starting point"
@@ -1018,6 +1398,8 @@ function App() {
               onFocus={() => setMobileExpanded(true)}
               onChange={(v) => {
                 setOriginQuery(v);
+                // Once the user starts editing, drop the geolocation origin
+                // so we don't keep their old position around in state.
                 if (origin?.isCurrent) setOrigin(null);
               }}
               onSelect={(p) => {
@@ -1030,6 +1412,8 @@ function App() {
             label="Where to?"
             icon="🔴"
             value={destQuery}
+            // Bias destination results toward the origin if known, otherwise
+            // toward the user's location.
             biasLat={origin?.lat ?? userLocation.current?.lat}
             biasLng={origin?.lng ?? userLocation.current?.lng}
             onFocus={() => setMobileExpanded(true)}
@@ -1038,10 +1422,14 @@ function App() {
               setDestination(p);
               setDestQuery(p.name);
             }}
+            // Clear button is suppressed during a scenic route fetch so the
+            // user can't yank the destination mid-Overpass-call.
             onClear={
               routeMode === "scenic" && loading ? undefined : handleReset
             }
           />
+          {/* Circular swap button. Only meaningful when origin row is shown.
+              Disabled when there's nothing to swap. */}
           {showOrigin && (
             <button
               onClick={handleSwap}
@@ -1071,6 +1459,8 @@ function App() {
           )}
         </div>
 
+        {/* Current-location pill (when origin row is hidden) OR a
+            "← Use my current location" link (when it's shown). */}
         {!showOrigin ? (
           <div
             style={{
@@ -1082,6 +1472,7 @@ function App() {
               order: isMobile ? 2 : 0,
             }}
           >
+            {/* Mini blue dot matching the "you are here" marker. */}
             <span
               style={{
                 width: "7px",
@@ -1118,6 +1509,8 @@ function App() {
             </button>
           </div>
         ) : (
+          // Back to current location: collapse the origin row and reseed
+          // origin from the cached userLocation if we have one.
           <button
             onClick={() => {
               setShowOrigin(false);
@@ -1146,6 +1539,8 @@ function App() {
           </button>
         )}
 
+        {/* GEO ERROR BANNER — orange warning shown when geolocation fails and
+            we don't have an origin yet. Dismissable with the × button. */}
         {geoError && !origin && (
           <div
             role="status"
@@ -1181,6 +1576,7 @@ function App() {
             </button>
           </div>
         )}
+        {/* ROUTE ERROR BANNER — red, shown when fetchRoute throws. */}
         {routeError && (
           <div
             role="alert"
@@ -1201,6 +1597,9 @@ function App() {
             <span style={{ flex: 1 }}>{routeError}</span>
           </div>
         )}
+        {/* SUMMARY ROW — either a spinner with status text (loading) or
+            distance + duration columns (success). Hidden when there's an
+            error so we don't show stale data next to it. */}
         {(loading || routeInfo) && !routeError && (
           <div
             style={{
@@ -1216,6 +1615,8 @@ function App() {
           >
             {loading ? (
               <>
+                {/* Spinner — keyframes defined in the <style> block below.
+                    Border color matches the active mode's accent. */}
                 <div
                   style={{
                     width: "14px",
@@ -1232,6 +1633,7 @@ function App() {
               </>
             ) : (
               <>
+                {/* Distance column. */}
                 <div
                   style={{
                     flex: 1,
@@ -1271,6 +1673,7 @@ function App() {
                     </span>
                   </div>
                 </div>
+                {/* Vertical separator between Distance and Duration columns. */}
                 <div
                   style={{
                     width: "1px",
@@ -1278,6 +1681,8 @@ function App() {
                     background: "rgba(255,255,255,0.08)",
                   }}
                 />
+                {/* Duration column — uses formatDuration() to split into
+                    day/hour/minute chunks. */}
                 <div
                   style={{
                     flex: 1,
@@ -1326,6 +1731,8 @@ function App() {
           </div>
         )}
 
+        {/* Scenic mode footer note: tell the user whether we actually
+            inserted detour waypoints or just used the back-road bias. */}
         {routeInfo && !loading && routeMode === "scenic" && (
           <div
             style={{
@@ -1342,6 +1749,19 @@ function App() {
         )}
       </div>
 
+      {/* ===================================================================
+          Embedded <style> block — global CSS that JSX inline styles can't
+          express:
+            - @keyframes for the spinner.
+            - Overrides for MapLibre's built-in control styling (the dark
+              glass look matches our panel).
+            - Mobile media query that:
+                * shrinks/moves the MapLibre control cluster
+                * forces inputs to 16px (prevents iOS Safari zoom on focus)
+                * animates the .mobile-collapsible section open/closed
+                * hides the zoom-in/-out buttons on mobile (pinch gesture
+                  is the expected interaction)
+          =================================================================== */}
       <style>{`
         @keyframes spin { to { transform: rotate(360deg); } }
         .maplibregl-ctrl-bottom-right { margin-right: 1rem !important; margin-bottom: 1rem !important; }
@@ -1366,6 +1786,7 @@ function App() {
           background: rgba(255,255,255,0.08) !important;
         }
         .maplibregl-ctrl-group button .maplibregl-ctrl-icon {
+          /* invert the default dark icons so they read on dark glass */
           filter: invert(1) brightness(1.2) opacity(0.85);
         }
         .maplibregl-ctrl-recenter {
@@ -1377,15 +1798,21 @@ function App() {
         .maplibregl-ctrl-recenter:hover {
           color: #a5b4fc;
         }
+        /* OSM/MapLibre attribution is hidden visually; OSM credit lives in
+           the README. Be aware of OSM's attribution requirement before
+           deploying. */
         .maplibregl-ctrl-attrib { display: none !important; }
         @media (max-width: 640px) {
           .maplibregl-ctrl-bottom-right {
             margin-right: 0.5rem !important;
+            /* safe-area-inset accounts for iPhone home indicator. */
             margin-bottom: calc(0.5rem + env(safe-area-inset-bottom, 0px)) !important;
           }
           .maplibregl-ctrl-group button { width: 42px !important; height: 42px !important; }
+          /* 16px+ prevents iOS Safari from auto-zooming on input focus. */
           input { font-size: 16px !important; }
           .searchbox-wrap { padding: 0.45rem 0.6rem !important; }
+          /* Spring-eased collapse for the mobile control section. */
           .mobile-collapsible {
             overflow: hidden;
             transition:
@@ -1409,9 +1836,11 @@ function App() {
             opacity: 1;
             transform: translateY(0) scaleY(1);
           }
+          /* Respect users who've asked for reduced motion. */
           @media (prefers-reduced-motion: reduce) {
             .mobile-collapsible { transition: none; }
           }
+          /* Hide the +/- zoom buttons on mobile — pinch-to-zoom covers it. */
           .maplibregl-ctrl-group:has(.maplibregl-ctrl-zoom-in) {
             display: none !important;
           }

@@ -1,3 +1,15 @@
+/* ============================================================================
+ * index.css — global base styles loaded once by main.jsx.
+ *
+ * The goal is to set up a full-viewport, non-scrolling shell so the map can
+ * fill the screen and our floating panel can sit on top of it. All the
+ * component-specific CSS lives in App.jsx (inline styles + the embedded
+ * <style> block).
+ * ========================================================================== */
+
+/* Reset margins/padding, lock html and body to viewport size, and prevent
+ * the page from scrolling — the map handles its own pan/zoom. The dark
+ * background matches the panel so flashes during load aren't jarring. */
 html, body {
   margin: 0;
   padding: 0;
@@ -7,12 +19,18 @@ html, body {
   background: #1a1a1c;
 }
 
+/* Root mount node. 100lvh is the "large viewport height" unit: it ignores
+ * mobile browser UI chrome (address bar) so the map stays full-bleed even
+ * as the bar collapses or expands during scroll. */
 #root {
   width: 100%;
   height: 100lvh;
   overflow: hidden;
 }
 
+/* System font stack — uses the native UI font on whichever OS the user is
+ * on (San Francisco on macOS/iOS, Segoe UI on Windows, etc.). No webfont
+ * download = faster first paint. */
 body {
   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
 }
