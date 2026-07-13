@@ -670,7 +670,6 @@ function App() {
   const userLocation = useRef(null);
 
   const {
-    navState,
     setNavState,
     isNavigating,
     navError,
@@ -1901,6 +1900,12 @@ function App() {
                 </div>
               </>
             )}
+          </div>
+        )}
+
+        {navError && !isNavigating && (
+          <div className="navigation-bar__error" role="alert">
+            {navError}
           </div>
         )}
 

@@ -5,8 +5,20 @@
 // -----------------------------------------------------------------------------
 
 import { useCallback, useEffect, useRef, useState } from "react";
+import maplibregl from "maplibre-gl";
 import { cancelSpeech } from "./voiceGuidance.js";
 import { resolveHeading } from "./snapToRoute.js";
+
+function createUserMarkerElement() {
+  const el = document.createElement("div");
+  el.style.cssText = `
+    width: 16px; height: 16px; border-radius: 50%;
+    background: #4285f4;
+    border: 3px solid white;
+    box-shadow: 0 0 0 6px rgba(66,133,244,0.25), 0 2px 8px rgba(0,0,0,0.3);
+  `;
+  return el;
+}
 
 const WATCH_OPTIONS = {
   enableHighAccuracy: true,
@@ -40,6 +52,23 @@ export function useNavigation({ mapRef, userMarkerRef, userLocationRef }) {
     map.easeTo({ pitch: 0, bearing: 0, duration: 500 });
   }, [mapRef]);
 
+  const ensureUserMarker = useCallback(
+    (lng, lat) => {
+      const map = mapRef.current;
+      if (!map) return;
+      if (!userMarkerRef.current) {
+        userMarkerRef.current = new maplibregl.Marker({
+          element: createUserMarkerElement(),
+        })
+          .setLngLat([lng, lat])
+          .addTo(map);
+      } else {
+        userMarkerRef.current.setLngLat([lng, lat]);
+      }
+    },
+    [mapRef, userMarkerRef],
+  );
+
   const followCamera = useCallback(
     (lng, lat, heading) => {
       const map = mapRef.current;
@@ -63,10 +92,10 @@ export function useNavigation({ mapRef, userMarkerRef, userLocationRef }) {
   const applyPosition = useCallback(
     (lng, lat, heading) => {
       userLocationRef.current = { lng, lat };
-      userMarkerRef.current?.setLngLat([lng, lat]);
+      ensureUserMarker(lng, lat);
       followCamera(lng, lat, heading);
     },
-    [userLocationRef, userMarkerRef, followCamera],
+    [userLocationRef, ensureUserMarker, followCamera],
   );
 
   const handlePosition = useCallback(
@@ -132,7 +161,7 @@ export function useNavigation({ mapRef, userMarkerRef, userLocationRef }) {
         pitch: NAV_PITCH,
         duration: 600,
       });
-      userMarkerRef.current?.setLngLat([lng, lat]);
+      ensureUserMarker(lng, lat);
     }
 
     return stopWatch;
@@ -142,7 +171,7 @@ export function useNavigation({ mapRef, userMarkerRef, userLocationRef }) {
     stopWatch,
     mapRef,
     userLocationRef,
-    userMarkerRef,
+    ensureUserMarker,
   ]);
 
   // Sync preview/idle with whether a route is on screen (caller sets via setNavState).
