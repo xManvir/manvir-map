@@ -21,6 +21,11 @@
 import { useEffect, useRef, useState } from "react";
 import maplibregl from "maplibre-gl";
 import "maplibre-gl/dist/maplibre-gl.css";
+import { DirectionsList } from "./navigation/DirectionsList.jsx";
+import { NavigationBar } from "./navigation/NavigationBar.jsx";
+import { StartNavigationButton } from "./navigation/StartNavigationButton.jsx";
+import { formatDuration, parseDirections } from "./navigation/parseDirections.js";
+import { useNavigation } from "./navigation/useNavigation.js";
 
 // -----------------------------------------------------------------------------
 // DETOUR_LEVELS — how aggressively to look for scenic stops when the user
@@ -48,81 +53,6 @@ const SCENIC_FEATURE_WEIGHTS = {
   water: 2,
   park: 1.2,
 };
-
-// -----------------------------------------------------------------------------
-// formatDuration — convert a number of seconds into an array of { value, unit }
-// chunks for rendering, e.g. 7320s → [{2,"h"},{2,"min"}]. Skips minutes once
-// the trip is longer than a day, so we never show "3d 4h 17min".
-// -----------------------------------------------------------------------------
-function formatDuration(sec) {
-  const totalMin = Math.max(1, Math.round(sec / 60));
-  const days = Math.floor(totalMin / (60 * 24));
-  const hours = Math.floor((totalMin % (60 * 24)) / 60);
-  const mins = totalMin % 60;
-  const parts = [];
-  if (days) parts.push({ value: days, unit: "d" });
-  if (hours) parts.push({ value: hours, unit: "h" });
-  if (mins && !days) parts.push({ value: mins, unit: "min" });
-  return parts;
-}
-
-// -----------------------------------------------------------------------------
-// maneuverIcon — map Valhalla maneuver type codes to a single display glyph.
-// Full enum: https://valhalla.github.io/valhalla/api/turn-by-turn/api-reference/
-// -----------------------------------------------------------------------------
-function maneuverIcon(type) {
-  const icons = {
-    1: "🟢", 2: "↱", 3: "↰", 4: "🏁",
-    6: "↑", 7: "↗", 8: "→", 9: "↱",
-    10: "↩", 11: "↖", 12: "←", 13: "↰", 14: "↪",
-    15: "↗", 16: "↱", 17: "↰", 18: "↱", 19: "↰",
-    20: "↑", 21: "↗", 22: "↖",
-    23: "⇄", 24: "⭕", 25: "↗",
-    26: "⛴", 27: "⛴",
-  };
-  return icons[type] ?? "•";
-}
-
-// -----------------------------------------------------------------------------
-// formatStepMeta — compact distance + duration line for one maneuver row.
-// -----------------------------------------------------------------------------
-function formatStepMeta(lengthKm, durationSec) {
-  const parts = [];
-  if (lengthKm >= 0.05) {
-    parts.push(
-      lengthKm < 1
-        ? `${Math.round(lengthKm * 1000)} m`
-        : `${lengthKm.toFixed(1)} km`,
-    );
-  }
-  if (durationSec >= 10) {
-    parts.push(
-      formatDuration(durationSec)
-        .map((p) => `${p.value} ${p.unit}`)
-        .join(" "),
-    );
-  }
-  return parts.join(" · ");
-}
-
-// -----------------------------------------------------------------------------
-// parseDirections — flatten Valhalla trip legs into a single ordered step list.
-// -----------------------------------------------------------------------------
-function parseDirections(trip) {
-  if (!trip?.legs) return [];
-  return trip.legs.flatMap((leg, legIndex) =>
-    (leg.maneuvers ?? []).map((m, i) => ({
-      id: `${legIndex}-${i}`,
-      type: m.type,
-      instruction: m.instruction || "",
-      lengthKm: m.length ?? 0,
-      durationSec: m.time ?? 0,
-      beginShapeIndex: m.begin_shape_index ?? 0,
-      endShapeIndex: m.end_shape_index ?? 0,
-      streetNames: m.street_names ?? [],
-    })),
-  );
-}
 
 // -----------------------------------------------------------------------------
 // toLocalMeters — convert a (lat,lng) pair into a flat (x,y) in metres,
@@ -636,130 +566,6 @@ function SearchBox({ label, icon, value, onChange, onSelect, onClear, inputRef, 
 }
 
 // =============================================================================
-// DirectionsList — scrollable turn-by-turn steps for the active route.
-//
-// Props:
-//   steps       : array from parseDirections()
-//   accentColor : matches the active routing mode color
-//   isMobile    : tighter spacing + shorter max-height on small screens
-// =============================================================================
-function DirectionsList({ steps, accentColor, isMobile }) {
-  const [expanded, setExpanded] = useState(true);
-
-  if (!steps?.length) return null;
-
-  return (
-    <div
-      className="directions-list"
-      style={{
-        display: "flex",
-        flexDirection: "column",
-        gap: "0.35rem",
-        order: isMobile ? 5 : 0,
-      }}
-    >
-      <button
-        type="button"
-        onClick={() => setExpanded((v) => !v)}
-        aria-expanded={expanded}
-        style={{
-          display: "flex",
-          alignItems: "center",
-          justifyContent: "space-between",
-          background: "rgba(255,255,255,0.04)",
-          border: "1px solid rgba(255,255,255,0.06)",
-          borderRadius: "8px",
-          padding: "0.4rem 0.55rem",
-          cursor: "pointer",
-          color: "rgba(255,255,255,0.85)",
-          fontSize: "0.72rem",
-          fontWeight: 600,
-        }}
-      >
-        <span>Directions ({steps.length} steps)</span>
-        <span
-          style={{
-            opacity: 0.6,
-            transform: expanded ? "rotate(180deg)" : "rotate(0deg)",
-            transition: "transform 0.15s",
-          }}
-        >
-          ▾
-        </span>
-      </button>
-      {expanded && (
-        <ol
-          style={{
-            margin: 0,
-            padding: "0.25rem",
-            listStyle: "none",
-            background: "rgba(255,255,255,0.03)",
-            border: "1px solid rgba(255,255,255,0.06)",
-            borderRadius: "8px",
-            maxHeight: isMobile ? "min(36dvh, 240px)" : "min(42vh, 320px)",
-            overflowY: "auto",
-          }}
-        >
-          {steps.map((step, i) => {
-            const meta = formatStepMeta(step.lengthKm, step.durationSec);
-            const isLast = i === steps.length - 1;
-            return (
-              <li
-                key={step.id}
-                style={{
-                  display: "flex",
-                  gap: "0.55rem",
-                  padding: "0.45rem 0.4rem",
-                  borderBottom: isLast
-                    ? "none"
-                    : "1px solid rgba(255,255,255,0.05)",
-                }}
-              >
-                <span
-                  aria-hidden
-                  style={{
-                    width: "1.25rem",
-                    flexShrink: 0,
-                    textAlign: "center",
-                    fontSize: "0.85rem",
-                    lineHeight: 1.35,
-                    color: accentColor,
-                  }}
-                >
-                  {maneuverIcon(step.type)}
-                </span>
-                <div style={{ flex: 1, minWidth: 0 }}>
-                  <div
-                    style={{
-                      fontSize: "0.78rem",
-                      color: "#f3f4f6",
-                      lineHeight: 1.35,
-                    }}
-                  >
-                    {step.instruction}
-                  </div>
-                  {meta && (
-                    <div
-                      style={{
-                        fontSize: "0.65rem",
-                        opacity: 0.5,
-                        marginTop: "2px",
-                      }}
-                    >
-                      {meta}
-                    </div>
-                  )}
-                </div>
-              </li>
-            );
-          })}
-        </ol>
-      )}
-    </div>
-  );
-}
-
-// =============================================================================
 // App — the root component. Owns:
 //   - the MapLibre map instance (created exactly once)
 //   - origin/destination state and their search-box text
@@ -773,6 +579,8 @@ function App() {
   const mapContainer = useRef(null); // <div> the map paints into
   const map = useRef(null);          // the MapLibre Map instance
   const markers = useRef([]);        // origin + destination marker objects
+  const userMarker = useRef(null);   // blue "you are here" dot (updated during nav)
+  const routeCoords = useRef(null); // decoded [lng,lat][] for snap-to-route (Phase 2)
 
   // -------------------- routing state --------------------
   const [origin, setOrigin] = useState(null);          // { lng, lat, name, isCurrent? }
@@ -860,6 +668,29 @@ function App() {
   // The user's current geolocation, in a ref because it doesn't need to
   // trigger re-renders on its own.
   const userLocation = useRef(null);
+
+  const {
+    navState,
+    setNavState,
+    isNavigating,
+    navError,
+    startNavigation,
+    endNavigation,
+  } = useNavigation({
+    mapRef: map,
+    userMarkerRef: userMarker,
+    userLocationRef: userLocation,
+  });
+
+  // Keep navigation state in sync with whether a route is on screen.
+  useEffect(() => {
+    if (isNavigating) {
+      if (routeError) endNavigation();
+      return;
+    }
+    if (routeInfo && !routeError) setNavState("preview");
+    else setNavState("idle");
+  }, [routeInfo, routeError, isNavigating, setNavState, endNavigation]);
 
   // ---------------------------------------------------------------------------
   // reverseGeocode — ask Photon for a human-readable name for a coordinate.
@@ -1016,7 +847,7 @@ function App() {
             border: 3px solid white;
             box-shadow: 0 0 0 6px rgba(66,133,244,0.25), 0 2px 8px rgba(0,0,0,0.3);
           `;
-          new maplibregl.Marker({ element: el })
+          userMarker.current = new maplibregl.Marker({ element: el })
             .setLngLat([lng, lat])
             .addTo(map.current);
 
@@ -1145,12 +976,14 @@ function App() {
     scenicMarkers.current.forEach((m) => m.remove());
     scenicMarkers.current = [];
     routeBounds.current = null;
+    routeCoords.current = null;
     recenterTarget.current = "user";
     // Forget the last endpoint signature so re-entering the same trip
     // after a reset counts as "brand new" and re-collapses the mobile panel.
     lastRouteEndpointsRef.current = "";
     setRouteInfo(null);
     setDirections(null);
+    endNavigation();
   }
 
   // ---------------------------------------------------------------------------
@@ -1354,6 +1187,7 @@ function App() {
       if (coords.length === 0) {
         throw new Error("Route returned no geometry.");
       }
+      routeCoords.current = coords;
       const geojson = {
         type: "Feature",
         geometry: { type: "LineString", coordinates: coords },
@@ -1389,14 +1223,15 @@ function App() {
       );
       routeBounds.current = bounds;
       recenterTarget.current = "route";
-      // Padding differs between mobile (panel is on top) and desktop (panel
-      // is on the left). Numbers tuned so the route never hides behind UI.
-      map.current.fitBounds(bounds, {
-        padding: isMobile
-          ? { top: 240, bottom: 80, left: 40, right: 40 }
-          : { top: 80, bottom: 80, left: 340, right: 80 },
-        duration: 600,
-      });
+      // Don't reframe the map while the user is actively navigating.
+      if (!isNavigating) {
+        map.current.fitBounds(bounds, {
+          padding: isMobile
+            ? { top: 240, bottom: 80, left: 40, right: 40 }
+            : { top: 80, bottom: 80, left: 340, right: 80 },
+          duration: 600,
+        });
+      }
     } catch (err) {
       // Supersession: a newer fetchRoute (or abortRoute) invalidated our
       // id. The newer call (or the reset that cancelled us) owns the UI —
@@ -1411,6 +1246,7 @@ function App() {
       setRouteError(msg);
       setRouteInfo(null);
       setDirections(null);
+      routeCoords.current = null;
       clearScenicMarkers();
       if (map.current?.getSource("route")) {
         map.current.removeLayer("route-line");
@@ -1445,6 +1281,7 @@ function App() {
     // catch handler treats the abort as "superseded" (silent) rather than
     // as a timeout, and can't redraw a route we just cleared.
     abortRoute();
+    endNavigation();
     setDestination(null);
     setDestQuery("");
     setRouteInfo(null);
@@ -1525,6 +1362,16 @@ function App() {
           overflow: "visible",
         }}
       >
+        {isNavigating ? (
+          <NavigationBar
+            destinationName={destQuery || destination?.name}
+            routeInfo={routeInfo}
+            onEnd={endNavigation}
+            accentColor={activeMode.color}
+            navError={navError}
+          />
+        ) : (
+        <>
         {/* App title — desktop only; mobile hides it to save vertical space. */}
         {!isMobile && (
           <div
@@ -2057,6 +1904,14 @@ function App() {
           </div>
         )}
 
+        {routeInfo && !loading && !routeError && (
+          <StartNavigationButton
+            onStart={startNavigation}
+            disabled={loading}
+            accentColor={activeMode.color}
+          />
+        )}
+
         {/* Scenic mode footer note: tell the user whether we actually
             inserted detour waypoints or just used the back-road bias. */}
         {routeInfo && !loading && routeMode === "scenic" && (
@@ -2082,6 +1937,8 @@ function App() {
             accentColor={activeMode.color}
             isMobile={isMobile}
           />
+        )}
+        </>
         )}
       </div>
 
