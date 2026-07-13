@@ -21,7 +21,6 @@
 import { useEffect, useRef, useState } from "react";
 import maplibregl from "maplibre-gl";
 import "maplibre-gl/dist/maplibre-gl.css";
-import { DirectionsList } from "./navigation/DirectionsList.jsx";
 import { NavigationBar } from "./navigation/NavigationBar.jsx";
 import { StartNavigationButton } from "./navigation/StartNavigationButton.jsx";
 import { formatDuration, parseDirections } from "./navigation/parseDirections.js";
@@ -588,7 +587,7 @@ function App() {
   const [originQuery, setOriginQuery] = useState("");  // text in origin SearchBox
   const [destQuery, setDestQuery] = useState("");      // text in dest SearchBox
   const [routeInfo, setRouteInfo] = useState(null);    // { distance, durationSec, waypointCount }
-  const [directions, setDirections] = useState(null);  // null | parseDirections() steps
+  const directionsRef = useRef(null);  // parsed maneuvers for live nav (Phase 2+)
   const [routeMode, setRouteMode] = useState("normal");// "normal" | "newDriver" | "scenic"
   const [loading, setLoading] = useState(false);
   const [loadingMsg, setLoadingMsg] = useState("Calculating route…");
@@ -981,7 +980,7 @@ function App() {
     // after a reset counts as "brand new" and re-collapses the mobile panel.
     lastRouteEndpointsRef.current = "";
     setRouteInfo(null);
-    setDirections(null);
+    directionsRef.current = null;
     endNavigation();
   }
 
@@ -1169,7 +1168,7 @@ function App() {
         durationSec: time,
         waypointCount: scenicWaypoints.length,
       });
-      setDirections(parseDirections(data.trip));
+      directionsRef.current = parseDirections(data.trip);
       // Auto-collapse the mobile panel ONLY when the endpoints just changed
       // (a brand-new trip), not on a pref/mode refetch — otherwise tweaking
       // toggles yanks the panel closed under the user's finger.
@@ -1244,7 +1243,7 @@ function App() {
         : err.message || "Couldn't fetch route";
       setRouteError(msg);
       setRouteInfo(null);
-      setDirections(null);
+      directionsRef.current = null;
       routeCoords.current = null;
       clearScenicMarkers();
       if (map.current?.getSource("route")) {
@@ -1284,7 +1283,7 @@ function App() {
     setDestination(null);
     setDestQuery("");
     setRouteInfo(null);
-    setDirections(null);
+    directionsRef.current = null;
     // Clear any error banner left over from the prior route — otherwise the
     // red banner persists with no route on screen and confuses the user.
     setRouteError(null);
@@ -1371,6 +1370,20 @@ function App() {
           />
         ) : (
         <>
+        {routeInfo && !loading && !routeError && (
+          <StartNavigationButton
+            onStart={startNavigation}
+            disabled={loading}
+            accentColor={activeMode.color}
+          />
+        )}
+
+        {navError && !isNavigating && (
+          <div className="navigation-bar__error" role="alert">
+            {navError}
+          </div>
+        )}
+
         {/* App title — desktop only; mobile hides it to save vertical space. */}
         {!isMobile && (
           <div
@@ -1903,20 +1916,6 @@ function App() {
           </div>
         )}
 
-        {navError && !isNavigating && (
-          <div className="navigation-bar__error" role="alert">
-            {navError}
-          </div>
-        )}
-
-        {routeInfo && !loading && !routeError && (
-          <StartNavigationButton
-            onStart={startNavigation}
-            disabled={loading}
-            accentColor={activeMode.color}
-          />
-        )}
-
         {/* Scenic mode footer note: tell the user whether we actually
             inserted detour waypoints or just used the back-road bias. */}
         {routeInfo && !loading && routeMode === "scenic" && (
@@ -1933,15 +1932,6 @@ function App() {
               ? `via ${routeInfo.waypointCount} scenic stop${routeInfo.waypointCount > 1 ? "s" : ""}`
               : "No scenic detours found — using back-road bias"}
           </div>
-        )}
-
-        {/* Turn-by-turn directions — hidden while loading or when route errored. */}
-        {directions && !routeError && (
-          <DirectionsList
-            steps={directions}
-            accentColor={activeMode.color}
-            isMobile={isMobile}
-          />
         )}
         </>
         )}
