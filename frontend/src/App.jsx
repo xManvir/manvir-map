@@ -67,6 +67,64 @@ function formatDuration(sec) {
 }
 
 // -----------------------------------------------------------------------------
+// maneuverIcon — map Valhalla maneuver type codes to a single display glyph.
+// Full enum: https://valhalla.github.io/valhalla/api/turn-by-turn/api-reference/
+// -----------------------------------------------------------------------------
+function maneuverIcon(type) {
+  const icons = {
+    1: "🟢", 2: "↱", 3: "↰", 4: "🏁",
+    6: "↑", 7: "↗", 8: "→", 9: "↱",
+    10: "↩", 11: "↖", 12: "←", 13: "↰", 14: "↪",
+    15: "↗", 16: "↱", 17: "↰", 18: "↱", 19: "↰",
+    20: "↑", 21: "↗", 22: "↖",
+    23: "⇄", 24: "⭕", 25: "↗",
+    26: "⛴", 27: "⛴",
+  };
+  return icons[type] ?? "•";
+}
+
+// -----------------------------------------------------------------------------
+// formatStepMeta — compact distance + duration line for one maneuver row.
+// -----------------------------------------------------------------------------
+function formatStepMeta(lengthKm, durationSec) {
+  const parts = [];
+  if (lengthKm >= 0.05) {
+    parts.push(
+      lengthKm < 1
+        ? `${Math.round(lengthKm * 1000)} m`
+        : `${lengthKm.toFixed(1)} km`,
+    );
+  }
+  if (durationSec >= 10) {
+    parts.push(
+      formatDuration(durationSec)
+        .map((p) => `${p.value} ${p.unit}`)
+        .join(" "),
+    );
+  }
+  return parts.join(" · ");
+}
+
+// -----------------------------------------------------------------------------
+// parseDirections — flatten Valhalla trip legs into a single ordered step list.
+// -----------------------------------------------------------------------------
+function parseDirections(trip) {
+  if (!trip?.legs) return [];
+  return trip.legs.flatMap((leg, legIndex) =>
+    (leg.maneuvers ?? []).map((m, i) => ({
+      id: `${legIndex}-${i}`,
+      type: m.type,
+      instruction: m.instruction || "",
+      lengthKm: m.length ?? 0,
+      durationSec: m.time ?? 0,
+      beginShapeIndex: m.begin_shape_index ?? 0,
+      endShapeIndex: m.end_shape_index ?? 0,
+      streetNames: m.street_names ?? [],
+    })),
+  );
+}
+
+// -----------------------------------------------------------------------------
 // toLocalMeters — convert a (lat,lng) pair into a flat (x,y) in metres,
 // centered on a reference point. This is an "equirectangular" projection that
 // is fine for short distances (tens of km) because the curvature of the earth
@@ -578,6 +636,130 @@ function SearchBox({ label, icon, value, onChange, onSelect, onClear, inputRef, 
 }
 
 // =============================================================================
+// DirectionsList — scrollable turn-by-turn steps for the active route.
+//
+// Props:
+//   steps       : array from parseDirections()
+//   accentColor : matches the active routing mode color
+//   isMobile    : tighter spacing + shorter max-height on small screens
+// =============================================================================
+function DirectionsList({ steps, accentColor, isMobile }) {
+  const [expanded, setExpanded] = useState(true);
+
+  if (!steps?.length) return null;
+
+  return (
+    <div
+      className="directions-list"
+      style={{
+        display: "flex",
+        flexDirection: "column",
+        gap: "0.35rem",
+        order: isMobile ? 5 : 0,
+      }}
+    >
+      <button
+        type="button"
+        onClick={() => setExpanded((v) => !v)}
+        aria-expanded={expanded}
+        style={{
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "space-between",
+          background: "rgba(255,255,255,0.04)",
+          border: "1px solid rgba(255,255,255,0.06)",
+          borderRadius: "8px",
+          padding: "0.4rem 0.55rem",
+          cursor: "pointer",
+          color: "rgba(255,255,255,0.85)",
+          fontSize: "0.72rem",
+          fontWeight: 600,
+        }}
+      >
+        <span>Directions ({steps.length} steps)</span>
+        <span
+          style={{
+            opacity: 0.6,
+            transform: expanded ? "rotate(180deg)" : "rotate(0deg)",
+            transition: "transform 0.15s",
+          }}
+        >
+          ▾
+        </span>
+      </button>
+      {expanded && (
+        <ol
+          style={{
+            margin: 0,
+            padding: "0.25rem",
+            listStyle: "none",
+            background: "rgba(255,255,255,0.03)",
+            border: "1px solid rgba(255,255,255,0.06)",
+            borderRadius: "8px",
+            maxHeight: isMobile ? "min(36dvh, 240px)" : "min(42vh, 320px)",
+            overflowY: "auto",
+          }}
+        >
+          {steps.map((step, i) => {
+            const meta = formatStepMeta(step.lengthKm, step.durationSec);
+            const isLast = i === steps.length - 1;
+            return (
+              <li
+                key={step.id}
+                style={{
+                  display: "flex",
+                  gap: "0.55rem",
+                  padding: "0.45rem 0.4rem",
+                  borderBottom: isLast
+                    ? "none"
+                    : "1px solid rgba(255,255,255,0.05)",
+                }}
+              >
+                <span
+                  aria-hidden
+                  style={{
+                    width: "1.25rem",
+                    flexShrink: 0,
+                    textAlign: "center",
+                    fontSize: "0.85rem",
+                    lineHeight: 1.35,
+                    color: accentColor,
+                  }}
+                >
+                  {maneuverIcon(step.type)}
+                </span>
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <div
+                    style={{
+                      fontSize: "0.78rem",
+                      color: "#f3f4f6",
+                      lineHeight: 1.35,
+                    }}
+                  >
+                    {step.instruction}
+                  </div>
+                  {meta && (
+                    <div
+                      style={{
+                        fontSize: "0.65rem",
+                        opacity: 0.5,
+                        marginTop: "2px",
+                      }}
+                    >
+                      {meta}
+                    </div>
+                  )}
+                </div>
+              </li>
+            );
+          })}
+        </ol>
+      )}
+    </div>
+  );
+}
+
+// =============================================================================
 // App — the root component. Owns:
 //   - the MapLibre map instance (created exactly once)
 //   - origin/destination state and their search-box text
@@ -598,6 +780,7 @@ function App() {
   const [originQuery, setOriginQuery] = useState("");  // text in origin SearchBox
   const [destQuery, setDestQuery] = useState("");      // text in dest SearchBox
   const [routeInfo, setRouteInfo] = useState(null);    // { distance, durationSec, waypointCount }
+  const [directions, setDirections] = useState(null);  // null | parseDirections() steps
   const [routeMode, setRouteMode] = useState("normal");// "normal" | "newDriver" | "scenic"
   const [loading, setLoading] = useState(false);
   const [loadingMsg, setLoadingMsg] = useState("Calculating route…");
@@ -967,6 +1150,7 @@ function App() {
     // after a reset counts as "brand new" and re-collapses the mobile panel.
     lastRouteEndpointsRef.current = "";
     setRouteInfo(null);
+    setDirections(null);
   }
 
   // ---------------------------------------------------------------------------
@@ -1111,7 +1295,7 @@ function App() {
             locations,
             costing: "auto",
             costing_options: costingOptions[routeMode],
-            directions_options: { units: "kilometres" },
+            directions_options: { units: "kilometres", language: "en-US" },
           }),
           signal: ctrl.signal,
         });
@@ -1153,6 +1337,7 @@ function App() {
         durationSec: time,
         waypointCount: scenicWaypoints.length,
       });
+      setDirections(parseDirections(data.trip));
       // Auto-collapse the mobile panel ONLY when the endpoints just changed
       // (a brand-new trip), not on a pref/mode refetch — otherwise tweaking
       // toggles yanks the panel closed under the user's finger.
@@ -1225,6 +1410,7 @@ function App() {
         : err.message || "Couldn't fetch route";
       setRouteError(msg);
       setRouteInfo(null);
+      setDirections(null);
       clearScenicMarkers();
       if (map.current?.getSource("route")) {
         map.current.removeLayer("route-line");
@@ -1262,6 +1448,7 @@ function App() {
     setDestination(null);
     setDestQuery("");
     setRouteInfo(null);
+    setDirections(null);
     // Clear any error banner left over from the prior route — otherwise the
     // red banner persists with no route on screen and confuses the user.
     setRouteError(null);
@@ -1879,12 +2066,22 @@ function App() {
               opacity: 0.6,
               textAlign: "center",
               marginTop: "-0.3rem",
+              order: isMobile ? 4 : 0,
             }}
           >
             {routeInfo.waypointCount > 0
               ? `via ${routeInfo.waypointCount} scenic stop${routeInfo.waypointCount > 1 ? "s" : ""}`
               : "No scenic detours found — using back-road bias"}
           </div>
+        )}
+
+        {/* Turn-by-turn directions — hidden while loading or when route errored. */}
+        {directions && !routeError && (
+          <DirectionsList
+            steps={directions}
+            accentColor={activeMode.color}
+            isMobile={isMobile}
+          />
         )}
       </div>
 
